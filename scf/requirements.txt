@@ -1,0 +1,9 @@
+# SCF 刺激呈现模块依赖
+# 安装：pip install -r scf/requirements.txt
+# 说明：
+#   - pillow / numpy 为必装项（帧图生成与预览依赖）
+#   - psychopy 仅 stimulus.py 运行时需要；若安装失败（如 Python 版本暂无
+#     兼容包），可先跳过，用 python scf/preview.py 核对布局
+psychopy>=2024.1.0
+pillow>=10.0.0
+numpy>=1.24.0

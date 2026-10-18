@@ -1,0 +1,17 @@
+{
+  "pb_url": "ws://localhost:3000/ws/scb",
+  "mode": "mock",
+  "frequencies": [8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0],
+  "threshold": 0.45,
+  "confirm_count": 3,
+  "cooldown_s": 3.0,
+  "decode_window_s": 3.0,
+  "nd8_host": "127.0.0.1",
+  "nd8_port": 8899,
+  "srate": 250,
+  "record_srate": 1000,
+  "heartbeat_interval_s": 5.0,
+  "channels": ["Oz", "O1", "O2", "POz", "PO3", "PO4", "M1", "M2"],
+  "client_name": "scb",
+  "client_version": "0.1.0"
+}

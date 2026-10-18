@@ -1,0 +1,78 @@
+{
+  "refresh_rate": 60,
+  "window_size": [1920, 1080],
+  "frames_per_cycle": 60,
+  "layout": {
+    "rows": 2,
+    "cols": 4,
+    "margin_ratio": 0.04,
+    "gap_ratio": 0.03,
+    "label_ratio": 0.18
+  },
+  "commands": [
+    {
+      "id": "CMD_01",
+      "label": "客厅主灯 开/关",
+      "label_en": "Light ON/OFF",
+      "icon": "灯",
+      "freq_hz": 8.0,
+      "color": [255, 170, 64]
+    },
+    {
+      "id": "CMD_02",
+      "label": "客厅窗帘 开/合",
+      "label_en": "Curtain OPEN/CLOSE",
+      "icon": "帘",
+      "freq_hz": 9.0,
+      "color": [72, 178, 255]
+    },
+    {
+      "id": "CMD_03",
+      "label": "空调温度 +1℃",
+      "label_en": "AC Temp +1",
+      "icon": "暖",
+      "freq_hz": 10.0,
+      "color": [255, 92, 92]
+    },
+    {
+      "id": "CMD_04",
+      "label": "空调温度 -1℃",
+      "label_en": "AC Temp -1",
+      "icon": "冷",
+      "freq_hz": 11.0,
+      "color": [96, 120, 255]
+    },
+    {
+      "id": "CMD_05",
+      "label": "电视 开/关",
+      "label_en": "TV ON/OFF",
+      "icon": "视",
+      "freq_hz": 12.0,
+      "color": [178, 120, 255]
+    },
+    {
+      "id": "CMD_06",
+      "label": "紧急呼叫",
+      "label_en": "Emergency Call",
+      "icon": "呼",
+      "freq_hz": 13.0,
+      "color": [255, 64, 150]
+    },
+    {
+      "id": "CMD_07",
+      "label": "卧室灯 亮度循环",
+      "label_en": "Bedroom Brightness",
+      "icon": "亮",
+      "freq_hz": 14.0,
+      "color": [110, 220, 120]
+    },
+    {
+      "id": "CMD_08",
+      "label": "门锁 开/关",
+      "label_en": "Door Lock OPEN/CLOSE",
+      "icon": "锁",
+      "freq_hz": 15.0,
+      "color": [224, 224, 96]
+    }
+  ]
+}
