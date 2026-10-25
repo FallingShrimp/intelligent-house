@@ -21,13 +21,12 @@ for /f "usebackq delims=" %%a in (`powershell -NoProfile -Command "(Get-NetIPAdd
 if not defined LANIP set "LANIP=127.0.0.1"
 echo 局域网 IP: %LANIP%
 
-REM ---------- 依赖安装 / 构建（把 PB 的局域网地址烘焙进产物） ----------
+REM ---------- 依赖安装 / 构建（WS 走 5174 同源代理转发到本机 PB，无需烘焙地址） ----------
 if not exist "%ROOT%pf\node_modules" (
   echo [1/2] 安装 PF 依赖...
   pushd "%ROOT%pf" && call npm install && popd
 )
-echo [2/2] 构建 PF（VITE_PB_URL=ws://%LANIP%:3000/ws/pf）...
-set "VITE_PB_URL=ws://%LANIP%:3000/ws/pf"
+echo [2/2] 构建 PF...
 pushd "%ROOT%pf" && call npm run build && popd || (echo [错误] PF 构建失败 & pause & exit /b 1)
 
 REM ---------- 启动服务 ----------

@@ -24,6 +24,8 @@ export interface RoomRig {
   ambient: THREE.AmbientLight
   /** 茶几玻璃杯中的水体（「喝水」交互：缩放 y 即水位变化，见 SceneManager） */
   water: THREE.Mesh
+  /** 室内角落的台灯（联机对战：点击召唤僵尸，见 SceneManager.interact） */
+  lamp: THREE.Group
   dispose(): void
 }
 
@@ -66,6 +68,13 @@ export function buildRoom(scene: THREE.Scene): RoomRig {
   const floor = box(W + 0.6, 0.1, D + 0.6, floorMat)
   floor.position.y = -0.05
   group.add(floor)
+
+  // 南侧室外坝坝（z 3~9、x -6~6 的测试平台，与地板同高；南侧开放可直接跑出）
+  const deckMat = track(new THREE.MeshStandardMaterial({ color: 0xb59a76, roughness: 0.85 }))
+  const deck = box(12, 0.12, 6, deckMat)
+  deck.position.set(0, -0.06, 6)
+  deck.receiveShadow = true
+  group.add(deck)
 
   const ceiling = new THREE.Mesh(track(new THREE.PlaneGeometry(W, D)), ceilMat)
   ceiling.rotation.x = Math.PI / 2 // 法线朝下
@@ -274,12 +283,47 @@ export function buildRoom(scene: THREE.Scene): RoomRig {
   leaves.castShadow = true
   group.add(pot, leaves)
 
+  // ---------------- 台灯（东北角边几上，联机对战点击召唤僵尸） ----------------
+  const lamp = new THREE.Group()
+  // 小圆边几（单柱 + 底盘）
+  const standTop = new THREE.Mesh(track(new THREE.CylinderGeometry(0.22, 0.22, 0.04, 20)), woodMat)
+  standTop.position.y = 0.55
+  standTop.castShadow = true
+  const standPole = new THREE.Mesh(track(new THREE.CylinderGeometry(0.03, 0.03, 0.53, 12)), woodMat)
+  standPole.position.y = 0.275
+  standPole.castShadow = true
+  const standBase = new THREE.Mesh(track(new THREE.CylinderGeometry(0.18, 0.2, 0.03, 20)), woodMat)
+  standBase.position.y = 0.015
+  standBase.castShadow = true
+  lamp.add(standTop, standPole, standBase)
+  // 台灯本体：底座 + 灯杆 + 灯罩
+  const lampBaseMat = track(new THREE.MeshStandardMaterial({ color: 0x3a4450, roughness: 0.5, metalness: 0.4 }))
+  const lampBase = new THREE.Mesh(track(new THREE.CylinderGeometry(0.085, 0.1, 0.03, 16)), lampBaseMat)
+  lampBase.position.y = 0.575
+  lampBase.castShadow = true
+  const lampStem = new THREE.Mesh(track(new THREE.CylinderGeometry(0.014, 0.014, 0.24, 10)), lampBaseMat)
+  lampStem.position.y = 0.71
+  const shadeMat = track(new THREE.MeshStandardMaterial({
+    color: 0xf2e3c2, roughness: 0.85, emissive: 0xffc46b, emissiveIntensity: 0.55,
+  }))
+  const shade = new THREE.Mesh(track(new THREE.CylinderGeometry(0.085, 0.13, 0.15, 16, 1, true)), shadeMat)
+  shade.position.y = 0.9
+  shade.material.side = THREE.DoubleSide
+  const lampGlow = new THREE.PointLight(0xffc46b, 0.55, 2.6, 1.8)
+  lampGlow.position.y = 0.88
+  lamp.add(lampBase, lampStem, shade, lampGlow)
+  // 整组可交互（射线命中子网格后沿父链取 userData.interact）
+  lamp.userData.interact = 'lamp'
+  lamp.position.set(3.12, 0, -2.42)
+  group.add(lamp)
+
   scene.add(group)
 
   return {
     group,
     ambient,
     water,
+    lamp,
     dispose() {
       scene.remove(group)
       for (const d of disposables) d.dispose()

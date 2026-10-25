@@ -4,7 +4,7 @@
  * 与服务同进程启动（随机端口），覆盖联机世界模拟核心链路：
  * 1. 双 PF 客户端 hello（带 display_name）→ 各自分配 uuid + 不同随机颜色
  * 2. 世界快照：fp 玩家互见（10Hz 广播），free 玩家不在房间
- * 3. 房间内玩家上报 door_open → PB 生成共享僵尸
+ * 3. 房间内玩家点击台灯（mp_action lamp）→ PB 生成共享僵尸
  * 4. 玩家攻击僵尸 → dmg_z 事件（三段连击 90% = 9 伤害）
  * 5. 友伤：攻击其他玩家 → dmg_p 事件
  * 6. 完美格挡：对方 parry_start 后立即受击 → parry(perfect) + 攻击者 guardbreak
@@ -126,9 +126,9 @@ function nextSeq(): number {
   return ++seq
 }
 
-/** 上报 10Hz 输入（位置 / 朝向 / 模式 / 门） */
-function input(conn: TestConn, p: [number, number, number], dir: [number, number], mode: 'fp' | 'free', door = false): void {
-  send(conn, 'mp_input', nextSeq(), { p, yaw: 0, dir, mode, door_open: door, anim: null })
+/** 上报 10Hz 输入（位置 / 朝向 / 模式） */
+function input(conn: TestConn, p: [number, number, number], dir: [number, number], mode: 'fp' | 'free'): void {
+  send(conn, 'mp_input', nextSeq(), { p, yaw: 0, dir, mode, anim: null })
 }
 
 /** 轮询等待快照条件成立（10Hz world 消息） */
@@ -226,9 +226,9 @@ async function main(): Promise<void> {
 
   let zombieId = -1
   ok =
-    (await step('房间内玩家上报开门（door_open）→ PB 生成共享僵尸', async () => {
-      // A 客户端门本地视觉状态：开门（此处直接经 ui_command 同步门锁语义省略，door_open 由 mp_input 携带）
-      input(a, [-3.0, 1.6, 1.9], [-1, 0], 'fp', true)
+    (await step('房间内玩家点击台灯（mp_action lamp）→ PB 生成共享僵尸', async () => {
+      input(a, [-3.0, 1.6, 1.9], [-1, 0], 'fp')
+      send(a, 'mp_action', nextSeq(), { kind: 'lamp' })
       const w = await waitWorld(a, (w) => w.zombies.length > 0, '僵尸生成', 6000)
       zombieId = w.payload.zombies[0].id
       // 共享：B 的快照同样看得到
@@ -257,7 +257,7 @@ async function main(): Promise<void> {
       await sleep(400) // 服务端攻击最小间隔 0.3s
       // B 站到 A 前方 0.6m；A 转向 +x
       input(b, [-2.4, 1.6, 1.9], [-1, 0], 'fp')
-      input(a, [-3.0, 1.6, 1.9], [1, 0], 'fp', true)
+      input(a, [-3.0, 1.6, 1.9], [1, 0], 'fp')
       await sleep(150) // 输入到达 PB
       send(a, 'mp_action', nextSeq(), { kind: 'attack', segment: 1 })
       const dmg = await recvWhere(a, (m) => m.type === 'event' && m.payload.kind === 'dmg_p' && m.payload.uuid === uuidB, 'dmg_p(B)')

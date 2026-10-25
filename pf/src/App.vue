@@ -5,15 +5,18 @@
  * 格斗 HUD（血条/体力/僵尸目标/飘字/格挡指示/眩晕）由 SceneManager 回调驱动。
  */
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import BuffPickModal from './components/BuffPickModal.vue'
 import DevicePanel from './components/DevicePanel.vue'
+import DeathOverlay from './components/DeathOverlay.vue'
 import DisplayNameModal from './components/DisplayNameModal.vue'
 import EmergencyBanner from './components/EmergencyBanner.vue'
+import Leaderboard from './components/Leaderboard.vue'
 import MockCommandPanel from './components/MockCommandPanel.vue'
 import StatusBar from './components/StatusBar.vue'
 import { useDevicesStore, DEVICE_ORDER } from './stores/devices'
-import { SceneManager, type ViewMode } from './three/SceneManager'
+import { SceneManager, type PickState, type ViewMode } from './three/SceneManager'
 import type { CombatHud } from './three/combat'
-import type { DeviceId, DeviceState } from './protocol/messages'
+import type { DeviceId, DeviceState, NetPlayerState } from './protocol/messages'
 
 import { pbClient } from './ws/client'
 
@@ -22,6 +25,13 @@ const viewMode = ref<ViewMode>('fixed')
 const flying = ref(false)
 const locked = ref(false)
 const toast = ref('')
+// 死亡覆盖层状态（SceneManager 经 PB 快照推导；复活请求最终由 PB 校验）
+const dead = ref(false)
+const canRespawn = ref(false)
+// 玩家列表 / 杀敌榜（10Hz world 快照驱动）
+const roster = ref<NetPlayerState[]>([])
+// 击杀三选一增益（PB pick_phase / 我的选择变化时由 SceneManager 推送）
+const pick = ref<PickState>({ active: false, options: null, done: false })
 // 联机对战：首次连接（localStorage 无 DisplayName）时弹出名字输入框
 const needName = ref(!localStorage.getItem('DisplayName'))
 function confirmName(name: string) {
@@ -29,6 +39,10 @@ function confirmName(name: string) {
   pbClient.setDisplayName(name)
   pbClient.connect()
   needName.value = false
+}
+// 三选一：上报所选项（idx 为 PB 抽中的增益索引）
+function choosePick(idx: number) {
+  pbClient.sendMpAction({ kind: 'pick', idx })
 }
 let toastTimer = 0
 function showToast(msg: string) {
@@ -82,6 +96,12 @@ onMounted(() => {
         else parryTimer = flash(parryFlash, parryTimer)
       },
     },
+    (d, can) => {
+      dead.value = d
+      canRespawn.value = can
+    },
+    (players) => (roster.value = players),
+    (st) => (pick.value = st),
   )
 
   // 设备状态 → 3D 场景：按 device_id 引用比较，仅对实际变化的设备调用 apply。
@@ -122,6 +142,17 @@ onBeforeUnmount(() => {
       <span class="tick b"></span>
       <span class="tick l"></span>
       <span class="tick r"></span>
+      <!-- 重击蓄力扇环：圆心角 0~360° 表示进度 0~1，蓄满变金色 -->
+      <svg v-if="hud && hud.charge != null" class="charge-ring" viewBox="0 0 64 64">
+        <circle cx="32" cy="32" r="22" fill="none" stroke="rgba(0,0,0,0.35)" stroke-width="5" />
+        <circle
+          cx="32" cy="32" r="22" fill="none"
+          :stroke="hud.charge >= 1 ? '#ffc93c' : '#3fd8d0'"
+          stroke-width="5" stroke-linecap="round"
+          :stroke-dasharray="`${hud.charge * 2 * Math.PI * 22} ${2 * Math.PI * 22}`"
+          transform="rotate(-90 32 32)"
+        />
+      </svg>
     </div>
     <!-- 僵尸技能预警四角星（准星上方：点放大→成型→继续放大渐隐循环）
          金=可格挡普攻 / 白=不可格挡横扫（必须闪避）/ 紫=突进位移 -->
@@ -171,7 +202,19 @@ onBeforeUnmount(() => {
       <div class="stun-text">眩晕 {{ hud.stunnedFor.toFixed(1) }}s</div>
     </div>
     <EmergencyBanner />
+    <Leaderboard :players="roster" />
     <DisplayNameModal v-if="needName" @confirm="confirmName" />
+    <DeathOverlay
+      v-if="dead"
+      :can-respawn="canRespawn"
+      @respawn="pbClient.sendMpAction({ kind: 'respawn' })"
+    />
+    <BuffPickModal
+      v-if="pick.active"
+      :options="pick.options"
+      :done="pick.done"
+      @choose="choosePick"
+    />
     <MockCommandPanel />
     <DevicePanel />
     <StatusBar />
@@ -261,6 +304,14 @@ onBeforeUnmount(() => {
 .crosshair .tick.b { width: 1.5px; height: 6px; transform: translate(-50%, 7px); }
 .crosshair .tick.l { width: 6px; height: 1.5px; transform: translate(-13px, -50%); }
 .crosshair .tick.r { width: 6px; height: 1.5px; transform: translate(7px, -50%); }
+.charge-ring {
+  position: absolute;
+  left: 50%; top: 50%;
+  width: 64px; height: 64px;
+  transform: translate(-50%, -50%);
+  pointer-events: none;
+  filter: drop-shadow(0 0 4px rgba(63, 216, 208, 0.7));
+}
 
 /* ---------------- 僵尸攻击预警星 ---------------- */
 .attack-alert {

@@ -20,7 +20,15 @@ import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { PointerLockControls } from 'three/examples/jsm/controls/PointerLockControls.js'
 import { playSfx } from './audio'
-import type { Action, DeviceId, DeviceState, MpEventPayload, WorldPayload, ZNetState } from '../protocol/messages'
+import type {
+	Action,
+	DeviceId,
+	DeviceState,
+	MpEventPayload,
+	NetPlayerState,
+	WorldPayload,
+	ZNetState,
+} from '../protocol/messages'
 import { pbClient } from '../ws/client'
 import { PlayerCombat, type CombatHud } from './combat'
 import { buildDevices, type DeviceRigs } from './devices'
@@ -36,6 +44,15 @@ export interface CombatUiHooks {
 	onHud(hud: CombatHud): void
 	onFloat(text: string, sxPct: number, syPct: number, crit: boolean): void
 	onFlash(kind: 'hurt' | 'parry'): void
+}
+
+/** 击杀三选一状态（pick_phase / 我的选择变化时经 onPick 推给 App.vue） */
+export interface PickState {
+	active: boolean
+	/** 我抽到的 3 个增益索引（0–6；非 fp / 未进入选择时为 null） */
+	options: number[] | null
+	/** 我是否已选 */
+	done: boolean
 }
 
 /** 漫游参数（惯性运动模型） */
@@ -108,6 +125,13 @@ export class SceneManager {
 	private onUiCommand?: (deviceId: DeviceId, action: Action) => void
 	private onToast?: (msg: string) => void
 	private onLockChange?: (locked: boolean) => void
+	private onDeathState?: (dead: boolean, canRespawn: boolean) => void
+	private onRoster?: (players: NetPlayerState[]) => void
+	private onPick?: (st: PickState) => void
+	private meDead = false
+	private charging = false // 重击蓄力中（按住左键，移动冻结）
+	private pickSt: PickState = { active: false, options: null, done: false }
+	private lastPickKey = ''
 
 	// ---------------- 场景交互状态 ----------------
 	private raycaster = new THREE.Raycaster()
@@ -135,6 +159,9 @@ export class SceneManager {
 		onToast?: (msg: string) => void,
 		onLockChange?: (locked: boolean) => void,
 		combatHooks?: CombatUiHooks,
+		onDeathState?: (dead: boolean, canRespawn: boolean) => void,
+		onRoster?: (players: NetPlayerState[]) => void,
+		onPick?: (st: PickState) => void,
 	) {
 		this.onModeChange = onModeChange
 		this.onFlyChange = onFlyChange
@@ -142,6 +169,9 @@ export class SceneManager {
 		this.onToast = onToast
 		this.onLockChange = onLockChange
 		this.combatHooks = combatHooks
+		this.onDeathState = onDeathState
+		this.onRoster = onRoster
+		this.onPick = onPick
 
 		// ---------------- 渲染器 ----------------
 		this.renderer = new THREE.WebGLRenderer({ antialias: true })
@@ -186,7 +216,7 @@ export class SceneManager {
 		// ---------------- 静态房间与设备 ----------------
 		this.room = buildRoom(this.scene)
 		this.rigs = buildDevices(this.scene, this.room, this.tweens)
-		this.interactables = [...this.rigs.interactables, this.room.water]
+		this.interactables = [...this.rigs.interactables, this.room.water, this.room.lamp]
 
 		// ---------------- 控制器（两种视角互斥启用） ----------------
 		this.orbit = new OrbitControls(this.camera, this.renderer.domElement)
@@ -229,6 +259,11 @@ export class SceneManager {
 	setMode(mode: ViewMode) {
 		if (this.mode === mode || this.disposed) return
 		this.mode = mode
+		// 切视角一律取消蓄力（防残留冻结移动）
+		if (this.charging) {
+			this.charging = false
+			this.combat.endCharge()
+		}
 		if (mode === 'walk') {
 			// 进入漫游：相机移到室内人眼高度
 			this.orbit.enabled = false
@@ -272,6 +307,12 @@ export class SceneManager {
 		for (const z of this.zombies) this.scene.remove(z.group)
 		this.zombies = []
 		this.remotePlayers.dispose()
+		for (const w of this.wavesVis) {
+			this.scene.remove(w.mesh)
+			w.mesh.geometry.dispose()
+			w.mat.dispose()
+		}
+		this.wavesVis.length = 0
 		pbClient.onWorld = undefined
 		pbClient.onMpEvent = undefined
 		if (this.pendingPerfect !== null) window.clearTimeout(this.pendingPerfect)
@@ -288,8 +329,8 @@ export class SceneManager {
 	// ---------------- 内部实现 ----------------
 
 	private handleClick = () => {
-		// 漫游模式下点击画面 → 锁定鼠标（ESC 退出由浏览器处理）
-		if (this.mode === 'walk' && !this.disposed) {
+		// 漫游模式下点击画面 → 锁定鼠标（ESC 退出由浏览器处理）；三选一期间不锁定（需点击选项）
+		if (this.mode === 'walk' && !this.disposed && !this.pickSt.active) {
 			this.lockCtl.lock()
 			this.setupKeyCapture()
 		}
@@ -333,12 +374,16 @@ export class SceneManager {
 
 	private handlePointerDown = (e: PointerEvent) => {
 		if (e.button === 2) {
-			// 按住右键 → 格挡（仅第一人称锁定时）
-			if (this.mode === 'walk' && this.lockCtl.isLocked) this.combat.startBlock(this.lastTime)
+			// 按住右键 → 格挡（仅第一人称锁定时；蓄力中不可格挡）
+			if (this.mode === 'walk' && this.lockCtl.isLocked && !this.charging) this.combat.startBlock(this.lastTime)
 			return
 		}
 		if (e.button !== 0) return
 		this.pointerDownPos = { x: e.clientX, y: e.clientY }
+		// 第一人称锁定：按下左键开始蓄力重击（松开判定：<1s 普攻，≥1s 剑气）
+		if (this.mode === 'walk' && this.lockCtl.isLocked && this.combat.beginCharge(this.lastTime)) {
+			this.charging = true
+		}
 	}
 
 	private handlePointerUp = (e: PointerEvent) => {
@@ -349,9 +394,28 @@ export class SceneManager {
 		if (e.button !== 0 || !this.pointerDownPos || this.disposed) return
 		const moved = Math.hypot(e.clientX - this.pointerDownPos.x, e.clientY - this.pointerDownPos.y)
 		this.pointerDownPos = null
-		if (moved > CLICK_MOVE_PX) return // 拖拽视角，非点击
-		// 第一人称锁定：左键优先攻击（反击 > 追击 > 三段连击），无目标时回落到场景交互
+		if (moved > CLICK_MOVE_PX) {
+			// 拖拽视角非点击：取消蓄力
+			if (this.charging) {
+				this.charging = false
+				this.combat.endCharge()
+			}
+			return
+		}
+		// 第一人称锁定：蓄力判定释放（≥蓄力时长剑气，否则取消蓄力回落普攻/交互）
 		if (this.mode === 'walk' && this.lockCtl.isLocked) {
+			if (this.charging) {
+				this.charging = false
+				// fireWave 内部校验蓄满时长（不满自动清状态返回 false）
+				if (this.combat.fireWave(this.lastTime)) return
+			}
+			// 队友复活：准星指向 3m 内的尸体 → revive 意图（优先于攻击 / 交互）
+			const corpse = this.pickCorpse()
+			if (corpse) {
+				pbClient.sendMpAction({ kind: 'revive', target: corpse.uuid })
+				this.onToast?.(`正在复活 ${corpse.name}`)
+				return
+			}
 			const consumed = this.combat.onLeftClick(this.lastTime, this.zombies, this.remotePlayers.centers(), this.camera)
 			if (consumed) return
 			const tag = this.pickInteractable()
@@ -404,6 +468,32 @@ export class SceneManager {
 		return null
 	}
 
+	/**
+	 * 准星指向的最近尸体（水平距离 ≤3m、视线夹角内）：revive 意图目标。
+	 * 与 PB reviveBy 的距离/存活校验对齐（最终仍由 PB 权威裁决）。
+	 */
+	private pickCorpse(): { uuid: string; name: string } | null {
+		if (this.combat.dead) return null // 自己是尸体时不能复活别人
+		const corpses = this.remotePlayers.corpses()
+		if (!corpses.length) return null
+		const dir = new THREE.Vector3()
+		this.camera.getWorldDirection(dir)
+		const cp = this.camera.position
+		let best: { uuid: string; name: string } | null = null
+		let bestD = Infinity
+		for (const c of corpses) {
+			const dH = Math.hypot(c.x - cp.x, c.z - cp.z)
+			if (dH > 3) continue
+			const to = new THREE.Vector3(c.x - cp.x, c.y - cp.y, c.z - cp.z).normalize()
+			if (to.angleTo(dir) > 0.55) continue
+			if (dH < bestD) {
+				bestD = dH
+				best = { uuid: c.uuid, name: c.name }
+			}
+		}
+		return best
+	}
+
 	/** 执行交互：电视 / 空调经 ui_command 由 PB 状态机同步；门校验后端 locked；喝水为本地动画 */
 	private interact(tag: string) {
 		switch (tag) {
@@ -421,7 +511,16 @@ export class SceneManager {
 				this.doorOpen = !this.doorOpen
 				this.rigs.setDoorOpen(this.doorOpen)
 				this.onToast?.(this.doorOpen ? '开门' : '关门')
-				// 僵尸生成由 PB 统一裁决（door_open 经 mp_input 10Hz 上报）
+				break
+			}
+			case 'lamp': {
+				// 台灯召唤僵尸（PB 权威：fp 存活玩家每次点击 +1，上限 3 只）
+				if (this.mode !== 'walk') {
+					this.onToast?.('进入第一人称（V 键）才能使用台灯')
+					break
+				}
+				pbClient.sendMpAction({ kind: 'lamp' })
+				this.onToast?.('台灯闪烁——僵尸被召唤了！')
 				break
 			}
 			case 'water': {
@@ -442,7 +541,7 @@ export class SceneManager {
 
 	// ---------------- 联机对战：PB 快照 / 事件 → 本地表现 ----------------
 
-	/** 上报输入状态（10Hz）：位置 / 朝向 / 模式 / 门状态 / 当前动作标签 */
+	/** 上报输入状态（10Hz）：位置 / 朝向 / 模式 / 当前动作标签 */
 	private sendMpInput() {
 		const euler = new THREE.Euler().setFromQuaternion(this.camera.quaternion, 'YXZ')
 		const dir = new THREE.Vector3()
@@ -453,15 +552,82 @@ export class SceneManager {
 			yaw: r3(euler.y),
 			dir: [r3(dir.x / len), r3(dir.z / len)],
 			mode: this.mode === 'walk' ? 'fp' : 'free',
-			door_open: this.doorOpen && !this.doorLocked,
 			anim: this.combat.currentAnimTag(),
 		})
+	}
+
+	// ---------------- 重击剑气视觉（PB 事件驱动，本地飞行渲染） ----------------
+
+	/** 剑气月牙贴图（模块级缓存） */
+	private waveTex: THREE.CanvasTexture | null = null
+	private wavesVis: { mesh: THREE.Mesh; mat: THREE.MeshBasicMaterial; x: number; z: number; dx: number; dz: number; t: number; baseRot: number }[] = []
+
+	private getWaveTex(): THREE.CanvasTexture {
+		if (this.waveTex) return this.waveTex
+		const c = document.createElement('canvas')
+		c.width = 256
+		c.height = 128
+		const ctx = c.getContext('2d')!
+		ctx.translate(128, 64)
+		// 外层青色大弧 → 内层亮白弧（additive 叠出发光感）
+		for (const [r, w, col] of [
+			[86, 26, 'rgba(80, 230, 210, 0.55)'],
+			[86, 13, 'rgba(190, 255, 246, 0.95)'],
+			[86, 5, 'rgba(255, 255, 255, 1)'],
+		] as const) {
+			ctx.beginPath()
+			ctx.arc(0, 40, r, Math.PI * 1.15, Math.PI * 1.85)
+			ctx.lineWidth = w
+			ctx.strokeStyle = col
+			ctx.lineCap = 'round'
+			ctx.stroke()
+		}
+		const tex = new THREE.CanvasTexture(c)
+		tex.colorSpace = THREE.SRGBColorSpace
+		this.waveTex = tex
+		return tex
+	}
+
+	/** 生成剑气实体（wave 事件到达时调用，含发射者自己） */
+	private spawnWave(x: number, y: number, z: number, dx: number, dz: number) {
+		playSfx('roar') // 剑气破空声（各端本地播放，含发射者）
+		const mat = new THREE.MeshBasicMaterial({
+			map: this.getWaveTex(), transparent: true, opacity: 0.95,
+			blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
+		})
+		const mesh = new THREE.Mesh(new THREE.PlaneGeometry(2.8, 1.4), mat)
+		mesh.position.set(x, y, z)
+		// 水平躺放（绕 X -90°），再在水平面内把贴图凸缘（几何 +V）对齐飞行方向
+		const baseRot = Math.atan2(-dx, -dz)
+		mesh.rotation.set(-Math.PI / 2, 0, baseRot)
+		this.scene.add(mesh)
+		this.wavesVis.push({ mesh, mat, x, z, dx, dz, t: 0, baseRot })
+	}
+
+	private updateWaves(dt: number) {
+		for (let i = this.wavesVis.length - 1; i >= 0; i--) {
+			const w = this.wavesVis[i]
+			w.t += dt
+			if (w.t >= 1.2) {
+				this.scene.remove(w.mesh)
+				w.mesh.geometry.dispose()
+				w.mat.dispose()
+				this.wavesVis.splice(i, 1)
+				continue
+			}
+			w.x += w.dx * 12 * dt
+			w.z += w.dz * 12 * dt
+			w.mesh.position.set(w.x, 1.3 + Math.sin(w.t * 6) * 0.05, w.z)
+			w.mesh.rotation.z = w.baseRot + Math.sin(w.t * 14) * 0.12 // 挥摆
+			w.mat.opacity = Math.max(0, 0.95 * (1 - (w.t / 1.2) ** 3))
+		}
 	}
 
 	/** world 快照应用：远程玩家增删 / 僵尸状态机渲染 / 自己的权威数值 */
 	private applyWorld(w: WorldPayload) {
 		// 自己的圆柱体不渲染（避免遮挡第一人称视角），数据仍经 mine 用于 HUD
 		this.remotePlayers.applySnapshot(w.players, pbClient.you?.uuid ?? null)
+		this.onRoster?.(w.players)
 
 		const seen = new Set<number>()
 		for (const s of w.zombies) {
@@ -485,7 +651,35 @@ export class SceneManager {
 
 		const me = pbClient.you
 		const mine = me ? w.players.find((p) => p.uuid === me.uuid) : null
-		if (mine) this.combat.setNet(mine.hp, mine.st, mine.stun_for, w.chase_left)
+		if (mine) {
+			this.combat.setNet(mine, w.chase_left)
+			// 死亡覆盖层：能否手动复活由快照推导（PB 侧 mp_action respawn 仍做权威校验）
+			// 规则：无存活僵尸（含所有玩家死亡清场）→ 可手动复活；有队友存活且僵尸仍在
+			// → 禁止手动复活，必须等队友走近点击尸体（revive）复活
+			const zombiesAlive = w.zombies.some((z) => z.state !== 'dead')
+			const aliveOthers = w.players.filter((p) => p.fp && p.uuid !== me!.uuid && p.hp > 0).length
+			const canRespawn = !zombiesAlive || aliveOthers === 0
+			const dead = mine.hp <= 0
+			// 死亡期间每次快照都回调（canRespawn 随僵尸被消灭 / 队友阵亡而解锁）
+			if (dead || dead !== this.meDead) {
+				this.meDead = dead
+				this.onDeathState?.(dead, canRespawn)
+			}
+		}
+
+		// 三选一状态推送（变化时）：进入选择时释放指针锁定，让玩家能点击选项
+		const pickSt: PickState = {
+			active: w.pick_phase,
+			options: mine?.pick?.options ?? null,
+			done: mine?.pick?.done ?? false,
+		}
+		const key = `${pickSt.active}|${pickSt.options?.join(',') ?? ''}|${pickSt.done}`
+		if (key !== this.lastPickKey) {
+			this.lastPickKey = key
+			this.pickSt = pickSt
+			if (pickSt.active && this.mode === 'walk' && this.lockCtl.isLocked) this.lockCtl.unlock()
+			this.onPick?.(pickSt)
+		}
 	}
 
 	/** 僵尸状态切换 → 前摇预警音效（金=普攻 / 白=横扫 / 紫=突进 / 红圈=嘶吼） */
@@ -523,9 +717,15 @@ export class SceneManager {
 					this.combat.pushFloat(pos, `-${Math.round(e.amount)}`, false)
 				} else {
 					this.remotePlayers.flash(e.uuid)
+					this.remotePlayers.bleed(e.uuid)
 					const c = this.remotePlayers.centers().find((c) => c.uuid === e.uuid)
 					if (c) this.combat.pushFloat(new THREE.Vector3(c.x, 2.0, c.z), `-${Math.round(e.amount)}`, false)
 				}
+				break
+			}
+			case 'wave': {
+				// 重击剑气：各端本地渲染飞行视觉（伤害由 PB 弹道裁决）
+				this.spawnWave(e.x, e.y, e.z, e.dx, e.dz)
 				break
 			}
 			case 'parry': {
@@ -586,13 +786,14 @@ export class SceneManager {
 				break
 			case 'respawn':
 				if (e.uuid === me) {
-					this.camera.position.copy(WALK_SPAWN)
+					// 复活落点由 PB 下发：手动复活 = 出生点 / 队友复活 = 原地起立
+					this.camera.position.set(e.pos[0], e.pos[1], e.pos[2])
 					this.vel.set(0, 0, 0)
 					if (this.flying) {
 						this.flying = false
 						this.onFlyChange?.(false)
 					}
-					this.onToast?.('你被击倒了，已在出生点复活')
+					this.onToast?.('你已复活')
 				}
 				break
 		}
@@ -697,16 +898,23 @@ export class SceneManager {
 			this.vel.set(0, 0, 0) // 解锁时清空速度，避免恢复锁定时突进
 			return
 		}
+		if (this.combat.dead) {
+			this.vel.set(0, 0, 0) // 死亡：冻结移动，等待死亡覆盖层复活
+			return
+		}
 		const p = this.camera.position
 
 		// ---- 水平：WASD 沿相机水平朝向加速（惯性积累） ----
+		// 蓄力重击期间移动减速 50%（仍可移动），并打断疾跑
+		const chargeSlow = this.charging ? 0.5 : 1
+		if (this.charging) this.sprinting = false
 		const forward = (this.keys.has('KeyW') ? 1 : 0) - (this.keys.has('KeyS') ? 1 : 0)
 		const strafe = (this.keys.has('KeyD') ? 1 : 0) - (this.keys.has('KeyA') ? 1 : 0)
 		const hasInput = forward !== 0 || strafe !== 0
 		// 疾跑仅在按住 W 前进时维持
 		if (this.sprinting && forward <= 0) this.sprinting = false
 		const slow = this.lastTime < this.slowUntil ? 0.5 : 1 // 嘶吼减速
-		const maxSpeed = (this.sprinting ? SPRINT_SPEED : MAX_SPEED) * slow
+		const maxSpeed = (this.sprinting ? SPRINT_SPEED : MAX_SPEED) * slow * chargeSlow
 		const accel = (this.sprinting ? SPRINT_ACCEL : ACCEL_H) * slow
 		if (hasInput) {
 			const dir = new THREE.Vector3()
@@ -760,7 +968,8 @@ export class SceneManager {
 		p.y += this.vel.y * dt
 
 		// ---- 边界与限位（撞界时对应速度分量清零，避免贴墙蓄力） ----
-		// 西墙门洞（z 1.45–2.35）在开门状态下可穿行至门外门廊，其余情况夹在室内
+		// 西墙门洞（z 1.45–2.35）在开门状态下可穿行至门外门廊，其余情况夹在室内；
+		// 南面开放：z>3 后进入室外坝坝（宽平台，x ±5.5、z 到南缘 8.6）
 		const inDoorGate =
 			this.doorOpen && p.z > DOOR_GATE_Z0 && p.z < DOOR_GATE_Z1 && p.y < DOOR_GATE_Y
 		if (p.x < -3.5) {
@@ -778,6 +987,12 @@ export class SceneManager {
 				p.y = PORCH_CEIL
 				this.vel.y = Math.min(this.vel.y, 0)
 			}
+		} else if (p.z > 3.0) {
+			const cx = THREE.MathUtils.clamp(p.x, -5.5, 5.5)
+			if (cx !== p.x) {
+				p.x = cx
+				this.vel.x = 0
+			}
 		} else {
 			const cx = THREE.MathUtils.clamp(p.x, inDoorGate ? PORCH_X_MIN : -3.5, 3.5)
 			if (cx !== p.x) {
@@ -785,7 +1000,7 @@ export class SceneManager {
 				this.vel.x = 0
 			}
 		}
-		const cz = THREE.MathUtils.clamp(p.z, -2.5, 4.2)
+		const cz = THREE.MathUtils.clamp(p.z, -2.5, 8.6)
 		if (cz !== p.z) {
 			p.z = cz
 			this.vel.z = 0
@@ -826,7 +1041,7 @@ export class SceneManager {
 			// 格斗系统（本地剑动画 + 意图上报；伤害 / 眩晕 / 追击窗口由 PB 快照驱动）
 			const active = this.lockCtl.isLocked
 			this.combat.update(dt, time, this.camera, active)
-			// 联机输入上报（10Hz）：位置 / 朝向 / 模式 / 门状态 / 动作标签
+			// 联机输入上报（10Hz）：位置 / 朝向 / 模式 / 动作标签
 			if (pbClient.you && time - this.lastMpSent >= MP_INPUT_PERIOD) {
 				this.lastMpSent = time
 				this.sendMpInput()
@@ -837,6 +1052,7 @@ export class SceneManager {
 
 		// 远程玩家与僵尸插值渲染（固定视角下同样可见）
 		this.remotePlayers.update(dt)
+		this.updateWaves(dt)
 		for (const z of this.zombies) z.update(dt, time)
 		for (let i = this.zombies.length - 1; i >= 0; i--) {
 			if (this.zombies[i].removeMe) {

@@ -144,14 +144,19 @@ export interface MpInputPayload {
   yaw: number;
   dir: [number, number];
   mode: 'fp' | 'free';
-  door_open: boolean;
   anim?: string | null;
 }
 
 /** PF → PB 动作意图 */
 export interface MpActionPayload {
-  kind: 'attack' | 'parry_start' | 'parry_stop';
-  segment?: number;
+  kind: 'attack' | 'parry_start' | 'parry_stop' | 'respawn' | 'wave' | 'pick' | 'revive' | 'lamp'
+  segment?: number
+  /** wave 专用：蓄力时长 s（PB 按每秒 10 体力结算消耗） */
+  hold?: number
+  /** pick 专用：所选增益索引（0–6，必须是 PB 分到自己抽中的 3 项之一） */
+  idx?: number
+  /** revive 专用：要复活的队友（尸体）uuid */
+  target?: string
 }
 
 export type ZNetState =
@@ -163,9 +168,16 @@ export interface NetPlayerState {
   p: [number, number, number]; yaw: number;
   fp: boolean;
   hp: number; st: number;
+  /** 击杀三选一累积增益（血条比例 / 伤害数字等展示用） */
+  max_hp: number; max_st: number; atk: number; dmg_mul: number;
   stun_for: number;
   blocking: boolean;
   anim: string | null;
+  kills: number;
+  /** 格挡最大持续 s / 完美格挡窗口比例（窗口 = max_block × parry_pct）/ 重击蓄力时长 s */
+  max_block: number; parry_pct: number; charge_dur: number;
+  /** 三选一状态（进行中非空）：抽到的 3 个增益索引 + 是否已选 */
+  pick: { options: number[]; done: boolean } | null;
 }
 
 export interface NetZombieState {
@@ -181,6 +193,8 @@ export interface NetZombieState {
 export interface WorldPayload {
   t: number;
   chase_left: number;
+  /** 击杀三选一进行中（全员选完前 PB 冻结 tick） */
+  pick_phase: boolean;
   players: NetPlayerState[];
   zombies: NetZombieState[];
 }
@@ -197,9 +211,12 @@ export type MpEventPayload =
   | { kind: 'knockback'; uuid: string; dx: number; dz: number; speed: number }
   | { kind: 'slow'; uuid: string; dur: number }
   | { kind: 'guardbreak'; uuid: string; dur: number }
-  | { kind: 'respawn'; uuid: string }
+  /** 复活：pos 为复活落点（手动 = 出生点 / 队友复活 = 原地），PF 相机复位用 */
+  | { kind: 'respawn'; uuid: string; pos: [number, number, number] }
   | { kind: 'counter_open' }
-  | { kind: 'roar_interrupt'; id: number };
+  | { kind: 'roar_interrupt'; id: number }
+  /** 重击剑气：by 玩家从 (x,y,z) 沿 (dx,dz) 发射（各 PF 本地渲染飞行视觉，伤害由 PB 弹道裁决） */
+  | { kind: 'wave'; by: string; x: number; y: number; z: number; dx: number; dz: number };
 
 export interface HeartbeatPayload {
   acq_connected: boolean;

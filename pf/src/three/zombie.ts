@@ -179,10 +179,13 @@ export class NetZombie {
   update(dt: number, now: number) {
     const pos = this.group.position
 
-    // 出生钻出：enter 状态前 0.45s 由地面升起
+    // 出生钻出：enter 状态前 0.45s 由地面升起；其余状态（刷新后快照直建的
+    // 已在场僵尸等）一律恢复完整高度——构造器将 scale.y 置 0，必须在此复位
     if (this.state === 'enter' && this.spawnT < 1) {
       this.spawnT = Math.min(1, this.spawnT + dt / 0.45)
       this.group.scale.y = 0.95 * this.spawnT
+    } else if (this.group.scale.y !== 0.95) {
+      this.group.scale.y = 0.95
     }
 
     // 受击红闪

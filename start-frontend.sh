@@ -25,10 +25,9 @@ echo "  SSVEP 智能家居仿真平台 - 前端启动（预览模式）"
 echo "  PF preview:5174   SCF:刺激呈现"
 echo "========================================"
 
-# ---------- 依赖安装 / 构建（把 PB 的局域网地址烘焙进产物） ----------
+# ---------- 依赖安装 / 构建（WS 走 5174 同源代理转发到本机 PB，无需烘焙地址） ----------
 [ -d "$ROOT/pf/node_modules" ] || { echo "[1/2] 安装 PF 依赖..."; (cd "$ROOT/pf" && npm install) || exit 1; }
-echo "[2/2] 构建 PF（VITE_PB_URL=ws://$LANIP:3000/ws/pf）..."
-export VITE_PB_URL="ws://$LANIP:3000/ws/pf"
+echo "[2/2] 构建 PF..."
 (cd "$ROOT/pf" && npm run build) || { echo "[错误] PF 构建失败"; exit 1; }
 
 PIDS=()

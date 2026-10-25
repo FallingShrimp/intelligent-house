@@ -12,7 +12,7 @@
  */
 import * as THREE from 'three'
 import { pbClient } from '../ws/client'
-import type { NetZombieState } from '../protocol/messages'
+import type { NetPlayerState, NetZombieState } from '../protocol/messages'
 import { playSfx } from './audio'
 import { buildSword } from './sword'
 import type { NetZombie } from './zombie'
@@ -43,13 +43,11 @@ export interface CombatHud {
 	stunnedFor: number
 	chaseLeft: number
 	incomingSkill: 'normal' | 'sweep' | 'lunge' | null
+	/** 重击蓄力进度 0~1（未蓄力为 null；UI 准星扇环） */
+	charge: number | null
 	target: { hp: number; maxHp: number; stamina: number; maxStamina: number; vulnMul: number } | null
 }
 
-const MAX_HP = 100
-const MAX_STAMINA = 100
-const BLOCK_MAX_S = 1.0
-const BLOCK_PERFECT_S = 0.3
 const BLOCK_CD_S = 0.5
 const REACH = 3.0
 const REACH_ANGLE = 0.55
@@ -136,12 +134,17 @@ interface FloatReq {
 }
 
 export class PlayerCombat {
-	// PB 权威数值（world 快照写入）
-	hp = MAX_HP
-	stamina = MAX_STAMINA
+	// PB 权威数值（world 快照写入；上限/时长类随三选一增益经 setNet 更新）
+	hp = 100
+	maxHp = 100         // 血量上限（增益「血量上限 +20」累积）
+	stamina = 100
+	maxSt = 100         // 体力上限（增益「体力上限 +10」累积）
 	stunFor = 0          // 剩余眩晕秒
 	chaseLeft = 0        // 全局追击剩余次数
 	blocking = false
+	blockMaxS = 1.0      // 格挡最大持续 s（增益 +0.25s）
+	parryPct = 0.5       // 完美格挡窗口 = blockMaxS × parryPct（增益 +2%）
+	chargeDur = 1.0      // 重击蓄力时长 s（蓄力速度增益 → 时长缩短）
 
 	private stunUntilLocal = 0  // loop 秒钟基准的眩晕截止（快照 stun_for 折算）
 	private guardBreakUntil = 0
@@ -156,6 +159,8 @@ export class PlayerCombat {
 	private hudEmit = 0
 	private now = 0
 	private sword: THREE.Group | null = null
+	private chargeStart = -1   // >=0 表示蓄力重击中（按住左键）
+	private chargeNotified = false // 蓄满提示音已播
 	private disposed = false
 	private floats: FloatReq[] = []
 
@@ -183,14 +188,29 @@ export class PlayerCombat {
 
 	// ---------------- PB 快照 / 事件入口 ----------------
 
-	/** world 快照：写入本玩家权威数值（stun_for 为剩余秒） */
-	setNet(hp: number, st: number, stunFor: number, chaseLeft: number) {
-		this.hp = hp
-		this.stamina = st
-		this.stunFor = stunFor
-		if (stunFor > 0) this.stunUntilLocal = this.now + stunFor
+	/** world 快照：写入本玩家权威数值（stun_for 为剩余秒；上限 / 窗口 / 蓄力随增益更新） */
+	setNet(mine: NetPlayerState, chaseLeft: number) {
+		this.hp = mine.hp
+		this.stamina = mine.st
+		this.stunFor = mine.stun_for
+		if (mine.stun_for > 0) this.stunUntilLocal = this.now + mine.stun_for
 		this.chaseLeft = chaseLeft
+		this.maxHp = mine.max_hp
+		this.maxSt = mine.max_st
+		this.blockMaxS = mine.max_block
+		this.parryPct = mine.parry_pct
+		this.chargeDur = mine.charge_dur
+		// 死亡（hp=0）：强制结束本地格挡，等待玩家点击「复活」
+		if (mine.hp <= 0 && this.blocking) {
+			this.blocking = false
+			this.blockCdUntil = this.now + BLOCK_CD_S
+		}
 		this.emitHud(true)
+	}
+
+	/** 是否死亡（PB 快照 hp=0；等待玩家在死亡覆盖层点击复活） */
+	get dead(): boolean {
+		return this.hp <= 0
 	}
 
 	/** 嘶吼 / 横扫破防等事件：强制结束格挡并硬直 */
@@ -225,6 +245,7 @@ export class PlayerCombat {
 	 * 选择动画并上报 attack 意图（伤害由 PB 裁决）。无目标返回 false 交给场景交互。
 	 */
 	onLeftClick(now: number, zombies: NetZombie[], remotes: RemoteCenter[], camera: THREE.PerspectiveCamera): boolean {
+		if (this.hp <= 0) return true // 死亡：吞掉点击（复活经死亡覆盖层按钮）
 		if (this.stunUntilLocal > now) return true
 		if (now < this.guardBreakUntil) return true
 		if (this.blocking) this.endBlock(now)
@@ -269,6 +290,7 @@ export class PlayerCombat {
 	}
 
 	startBlock(now: number): boolean {
+		if (this.hp <= 0) return false
 		if (this.stunUntilLocal > now || this.blocking || now < this.blockCdUntil) return false
 		if (now < this.guardBreakUntil) return false
 		this.blocking = true
@@ -289,8 +311,48 @@ export class PlayerCombat {
 	/** 当前动作标签（mp_input.anim，供远程玩家渲染简单动作） */
 	currentAnimTag(): string | null {
 		if (this.cur) return this.cur.tag
+		if (this.chargeStart >= 0) return 'charge'
 		if (this.blocking) return 'block'
 		return null
+	}
+
+	// ---------------- 重击蓄力 ----------------
+
+	/** 是否可行动（未死亡 / 未眩晕 / 未破防） */
+	canAct(now: number): boolean {
+		return this.hp > 0 && this.stunUntilLocal <= now && now >= this.guardBreakUntil
+	}
+
+	/** 按下左键：开始蓄力（成功后 SceneManager 冻结移动） */
+	beginCharge(now: number): boolean {
+		if (!this.canAct(now) || this.blocking) return false
+		this.chargeStart = now
+		this.chargeNotified = false
+		return true
+	}
+
+	/** 已蓄力时长 s（未蓄力返回 0） */
+	chargeHold(now: number): number {
+		return this.chargeStart < 0 ? 0 : now - this.chargeStart
+	}
+
+	/** 取消蓄力（松开未满 / 拖拽 / 状态打断） */
+	endCharge(): void {
+		this.chargeStart = -1
+	}
+
+	/** 蓄满释放：上劈动画 + 发射剑气意图（未蓄满返回 false；hold 供 PB 结算蓄力体力消耗） */
+	fireWave(now: number): boolean {
+		if (this.chargeStart < 0 || now - this.chargeStart < this.chargeDur) {
+			this.chargeStart = -1
+			return false
+		}
+		const hold = now - this.chargeStart
+		this.chargeStart = -1
+		this.combo = -1 // 剑气不算三段连击
+		this.startSwing(SWING_CHASE, now)
+		pbClient.sendMpAction({ kind: 'wave', hold: Math.min(5, Math.round(hold * 10) / 10) })
+		return true
 	}
 
 	// ---------------- 帧更新 ----------------
@@ -301,7 +363,14 @@ export class PlayerCombat {
 		if (!active || !this.sword) return
 
 		// 格挡最长持续时间
-		if (this.blocking && now - this.blockStart >= BLOCK_MAX_S) this.endBlock(now)
+		if (this.blocking && now - this.blockStart >= this.blockMaxS) this.endBlock(now)
+		// 蓄力中状态失效（死亡 / 眩晕 / 破防）→ 自动取消
+		if (this.chargeStart >= 0 && !this.canAct(now)) this.chargeStart = -1
+		// 蓄满瞬间提示音（每次蓄力只播一次）
+		if (this.chargeStart >= 0 && !this.chargeNotified && now - this.chargeStart >= this.chargeDur) {
+			this.chargeNotified = true
+			playSfx('flashAlert')
+		}
 
 		// 挥砍推进（伤害判定在 PB，这里只推进动画与缓存连段）
 		if (this.cur) {
@@ -330,26 +399,34 @@ export class PlayerCombat {
 		this.updateGhosts(dt)
 		this.updatePose(dt, now)
 
+		// 蓄力重击姿态：剑举过头顶微微发抖（覆盖待机 / 格挡姿态）
+		if (this.chargeStart >= 0 && !this.cur && this.sword) {
+			const shake = Math.sin(now * 24) * 0.012
+			this.sword.position.set(BASE_P[0] + shake, BASE_P[1] + 0.34, BASE_P[2] - 0.08)
+			this.sword.rotation.set(BASE_R[0] - 2.3 + shake * 2, BASE_R[1], BASE_R[2] + 0.15)
+		}
+
 		if (now - this.hudEmit > 0.1) this.emitHud()
 	}
 
 	getHud(zombies: NetZombie[], camera: THREE.PerspectiveCamera): CombatHud {
 		const now = this.now
 		const t = this.aimTarget(zombies, camera)
-		const blockAge = this.blocking ? Math.min(1, (now - this.blockStart) / BLOCK_MAX_S) : 0
+		const blockAge = this.blocking ? Math.min(1, (now - this.blockStart) / this.blockMaxS) : 0
 		const cd = now >= this.blockCdUntil ? 1 : 1 - (this.blockCdUntil - now) / BLOCK_CD_S
 		const incoming = zombies.find((z) => !z.dead && (z.state === 'windup' || z.state === 'sweep' || z.state === 'lungeWind'))
 		return {
 			hp: Math.round(this.hp),
-			maxHp: MAX_HP,
+			maxHp: Math.round(this.maxHp),
 			stamina: Math.round(this.stamina),
-			maxStamina: MAX_STAMINA,
+			maxStamina: Math.round(this.maxSt),
 			blocking: this.blocking,
 			blockAge01: blockAge,
-			blockPerfect: this.blocking && now - this.blockStart <= BLOCK_PERFECT_S,
+			blockPerfect: this.blocking && now - this.blockStart <= this.blockMaxS * this.parryPct,
 			blockCd01: Math.max(0, Math.min(1, cd)),
 			stunnedFor: Math.max(0, this.stunUntilLocal - now),
 			chaseLeft: this.chaseLeft,
+			charge: this.chargeStart >= 0 ? Math.min(1, (now - this.chargeStart) / this.chargeDur) : null,
 			incomingSkill: incoming
 				? incoming.state === 'sweep' ? 'sweep' : incoming.state === 'lungeWind' ? 'lunge' : 'normal'
 				: null,
