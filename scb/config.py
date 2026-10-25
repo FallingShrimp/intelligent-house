@@ -20,7 +20,7 @@ SDK_SRC_PATH = PROJECT_ROOT / "NDDrone-SDK" / "src"
 class SCBConfig:
     """SCB 运行配置（config.json 可覆盖默认值）"""
     pb_url: str = "ws://localhost:3000/ws/scb"  # PB WebSocket 端点（可配置）
-    mode: str = "mock"                          # 采集模式：mock | nd8
+    mode: str = "nd8"                           # 采集模式：nd8
     frequencies: list[float] = field(
         default_factory=lambda: [8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0]
     )                                           # 8 类刺激频率，对应 CMD_01–CMD_08

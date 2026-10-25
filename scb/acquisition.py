@@ -1,5 +1,4 @@
-"""SCB 采集层：复用 NDDrone-SDK 的 NDThread（ND8 TCP 采集）+ 共平均参考（CAR），
-并提供无硬件联调用的 MockAcquisition（按目标刺激频率合成 SSVEP 信号）。"""
+"""SCB 采集层：复用 NDDrone-SDK 的 NDThread（ND8 TCP 采集）+ 共平均参考（CAR）。"""
 from __future__ import annotations
 
 import sys
@@ -89,53 +88,10 @@ class Nd8Acquisition(BaseAcquisition):
         self._nd.disconnect()
 
 
-class MockAcquisition(BaseAcquisition):
-    """模拟采集：按目标刺激频率合成 8 通道 SSVEP EEG，供无硬件联调。
-
-    信号模型：amp·sin(2πft) + amp/2·sin(4πft) + 高斯噪声 σ=5μV，采样率 250Hz；
-    幅度取 SSVEP 典型诱发幅值（μV 量级）。各通道施加随机幅度增益与微小相位差，
-    使共平均参考（CAR）后 SSVEP 成分仍保留。set_target(freq_hz) 由外部注入目标。
-    """
-
-    def __init__(self, srate: int = 250, n_channels: int = 8,
-                 noise_uv: float = 5.0, signal_amp_uv: float = 10.0,
-                 channels: list[str] | None = None, seed: int = 42):
-        self.srate = srate
-        self.channels = channels or []
-        self._n = n_channels
-        self._noise = noise_uv
-        self._amp = signal_amp_uv
-        self._target_hz = 10.0
-        self._rng = np.random.default_rng(seed)
-        # 通道间差异：增益 0.7~1.3、相位 ±0.3 rad（保证 CAR 不完全抵消信号）
-        self._gain = self._rng.uniform(0.7, 1.3, n_channels)
-        self._phase = self._rng.uniform(-0.3, 0.3, n_channels)
-        self._t0_s = time.time()  # 相位基准：以启动时刻为 0，避免绝对大数精度损失
-
-    def set_target(self, freq_hz: float) -> None:
-        """外部注入当前目标刺激频率（main 管线轮换调用）"""
-        self._target_hz = float(freq_hz)
-
-    def read_epoch(self, start_ms: int, length_s: float) -> np.ndarray:
-        n = int(self.srate * length_s)
-        # 相对时间（秒），保证相位连续
-        t = start_ms / 1000.0 - self._t0_s + np.arange(n) / self.srate
-        f = self._target_hz
-        # 基频 + 1/2 二次谐波；通道间增益/相位差异
-        x = (self._gain[:, None] * np.sin(2 * np.pi * f * t + self._phase[:, None])
-             + 0.5 * self._gain[:, None] * np.sin(4 * np.pi * f * t + 2 * self._phase[:, None]))
-        x = self._amp * x + self._rng.normal(0.0, self._noise, x.shape)
-        # 与 Nd8Acquisition 一致，输出前做 CAR
-        return x - x.mean(axis=0, keepdims=True)
-
-
 def build_acquisition(cfg) -> BaseAcquisition:
-    """按配置构建采集实例（mode: mock | nd8）"""
+    """按配置构建采集实例（mode: nd8）"""
     if cfg.mode == "nd8":
         return Nd8Acquisition(device_address=(cfg.nd8_host, cfg.nd8_port),
                               srate=cfg.srate, record_srate=cfg.record_srate,
                               channels=cfg.channels)
-    if cfg.mode == "mock":
-        return MockAcquisition(srate=cfg.srate, n_channels=len(cfg.channels),
-                               channels=cfg.channels)
-    raise ValueError(f"未知采集模式：{cfg.mode}（应为 mock | nd8）")
+    raise ValueError(f"未知采集模式：{cfg.mode}（应为 nd8）")

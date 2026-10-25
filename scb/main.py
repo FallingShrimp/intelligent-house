@@ -1,5 +1,5 @@
-"""SCB 异步入口：mock 模式循环运行解码管线（set_target 轮换 → 合成 epoch →
-FBCCA → 决策 → 上报 PB）；--smoke 仅发出 3 条确认指令后退出（联调用）。
+"""SCB 异步入口：ND8 采集循环运行解码管线（FBCCA → 决策 → 上报 PB）；
+--smoke 仅发出 3 条确认指令后退出（联调用）。
 
 启动方式（在 scb 目录下）：python -m scb.main [--smoke]
 也兼容直接运行：python scb/main.py [--smoke]
@@ -36,7 +36,6 @@ logger = logging.getLogger("scb.main")
 
 # 管线常量
 STEP_S = 0.25            # 滑动窗口步长
-TARGET_HOLD_S = 5.0      # mock 模式每个目标频率保持时长（3s 窗 + 3 窗确认 + 余量）
 SMOKE_COMMANDS = 3       # --smoke 需发出的确认指令数
 SMOKE_TOTAL_TIMEOUT = 90  # smoke 总超时（秒）
 PIPELINE_LOG_EVERY = 4   # 每 N 个窗口打印一次解码摘要
@@ -94,7 +93,7 @@ async def run_pipeline(cfg: SCBConfig, smoke: bool) -> int:
                     "window=%.1fs", cfg.threshold, cfg.confirm_count,
                     cfg.cooldown_s, cfg.decode_window_s)
 
-    # smoke 模式：最多尝试 2 次连接（无 PB 时快速进入离线自检）
+    # smoke 模式：最多尝试 2 次连接（无 PB 时快速失败退出）
     client = SCBClient(cfg,
                        status_provider=make_status_provider(cfg, acq),
                        on_config_update=on_config_update,
@@ -104,9 +103,6 @@ async def run_pipeline(cfg: SCBConfig, smoke: bool) -> int:
     try:
         got_welcome = await client.wait_welcome(timeout=10.0)
         if not got_welcome:
-            if smoke:
-                logger.warning("未收到 PB welcome，进入离线管线自检（不发送指令）")
-                return await _offline_check(cfg, acq, decoder, decision, client)
             logger.error("等待 PB welcome 超时，退出")
             return 1
 
@@ -115,12 +111,6 @@ async def run_pipeline(cfg: SCBConfig, smoke: bool) -> int:
                     "cooldown=%.1fs window=%.1fs",
                     cfg.mode, cfg.frequencies, cfg.threshold, cfg.confirm_count,
                     cfg.cooldown_s, cfg.decode_window_s)
-
-        # mock 模式：注入初始目标频率并轮换
-        if cfg.mode == "mock":
-            acq.set_target(cfg.frequencies[0])
-        target_idx = 0
-        last_switch = time.monotonic()
 
         # 窗口起始时间戳（ms）：首窗覆盖「过去 epoch 长度」的数据，之后按步长前移
         start_ms = time.time_ns() // 1_000_000 - int(decoder.epoch_length_s * 1000)
@@ -132,15 +122,6 @@ async def run_pipeline(cfg: SCBConfig, smoke: bool) -> int:
         next_beat = time.monotonic()
 
         while True:
-            # mock 目标频率轮换
-            if cfg.mode == "mock" and time.monotonic() - last_switch >= TARGET_HOLD_S:
-                target_idx = (target_idx + 1) % len(cfg.frequencies)
-                acq.set_target(cfg.frequencies[target_idx])
-                last_switch = time.monotonic()
-                logger.info("── 轮换目标频率 → %.1fHz（%s）",
-                            cfg.frequencies[target_idx],
-                            cmd_id_of(target_idx).value)
-
             # 采集（SDK 同步接口放线程池，避免阻塞事件循环）
             epoch = await asyncio.to_thread(acq.read_epoch, start_ms,
                                             decoder.epoch_length_s)
@@ -201,41 +182,6 @@ async def run_pipeline(cfg: SCBConfig, smoke: bool) -> int:
         client.stop()
         client_task.cancel()
         acq.close()
-
-
-async def _offline_check(cfg: SCBConfig, acq, decoder, decision, client) -> int:
-    """无 PB 时的离线管线自检：验证 mock 采集 → FBCCA → 决策闭环（仅日志）"""
-    log_scf_sync()
-    acq.set_target(cfg.frequencies[0])
-    target_idx = 0
-    last_switch = time.monotonic()
-    start_ms = time.time_ns() // 1_000_000 - int(decoder.epoch_length_s * 1000)
-    confirms = 0
-    deadline = time.monotonic() + 20.0
-    next_beat = time.monotonic()
-    while time.monotonic() < deadline and confirms < 3:
-        if time.monotonic() - last_switch >= TARGET_HOLD_S:
-            target_idx = (target_idx + 1) % len(cfg.frequencies)
-            acq.set_target(cfg.frequencies[target_idx])
-            last_switch = time.monotonic()
-            logger.info("── 轮换目标频率 → %.1fHz", cfg.frequencies[target_idx])
-        epoch = await asyncio.to_thread(acq.read_epoch, start_ms,
-                                        decoder.epoch_length_s)
-        start_ms += int(STEP_S * 1000)
-        class_idx, rho = decoder.predict(epoch)
-        confirmed = decision.update(class_idx, rho)
-        logger.info("win 识别 %.1fHz ρ=%.3f 阈值=%.2f → %s",
-                    freq_of(class_idx, cfg.frequencies), rho, cfg.threshold,
-                    f"确认 {cmd_id_of(confirmed).value}" if confirmed is not None
-                    else "未确认")
-        if confirmed is not None:
-            confirms += 1
-        next_beat += STEP_S
-        await asyncio.sleep(max(0.0, next_beat - time.monotonic()))
-    ok = confirms >= 1
-    logger.info("======== 离线自检 %s（确认 %d 条指令，PB 未连接不发送）========",
-                "PASS" if ok else "FAIL", confirms)
-    return 0 if ok else 1
 
 
 async def _amain(smoke: bool) -> int:

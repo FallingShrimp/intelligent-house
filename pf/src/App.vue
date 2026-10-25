@@ -7,6 +7,7 @@
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import DevicePanel from './components/DevicePanel.vue'
 import EmergencyBanner from './components/EmergencyBanner.vue'
+import MockCommandPanel from './components/MockCommandPanel.vue'
 import StatusBar from './components/StatusBar.vue'
 import { useDevicesStore, DEVICE_ORDER } from './stores/devices'
 import { SceneManager, type ViewMode } from './three/SceneManager'
@@ -161,6 +162,7 @@ onBeforeUnmount(() => {
       <div class="stun-text">眩晕 {{ hud.stunnedFor.toFixed(1) }}s</div>
     </div>
     <EmergencyBanner />
+    <MockCommandPanel />
     <DevicePanel />
     <StatusBar />
     <div v-if="viewMode === 'fixed'" class="hint">拖拽旋转视角 · <b>左键点击</b>门 / 电视 / 空调 / 水杯交互 · 按 <b>V</b> 进入第一人称漫游</div>
