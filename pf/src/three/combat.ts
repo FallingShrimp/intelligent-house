@@ -13,7 +13,7 @@
 import * as THREE from 'three'
 import { playSfx } from './audio'
 import { buildSword } from './sword'
-import type { Zombie } from './zombie'
+import type { Zombie, ZombieTelegraph } from './zombie'
 
 export interface CombatHooks {
 	onHud(): void
@@ -34,7 +34,7 @@ export interface CombatHud {
 	blockCd01: number       // 冷却进度 0..1（1 = 就绪）
 	stunnedFor: number      // 剩余眩晕秒数
 	chaseLeft: number       // 剩余追击次数
-	incomingAttack: boolean // 有僵尸正处于攻击前摇（金色四角星预警）
+	incomingSkill: ZombieTelegraph // 僵尸技能预警（normal 金 / sweep 白 / lunge 紫）
 	target: { hp: number; maxHp: number; stamina: number; maxStamina: number; vulnMul: number } | null
 }
 
@@ -47,6 +47,10 @@ const BLOCK_MAX_S = 1.0
 const BLOCK_PERFECT_S = 0.3
 const BLOCK_CD_S = 0.5
 const PLAYER_STUN_S = 3
+const GUARD_BREAK_S = 0.55      // 横扫破防硬直（无法格挡/攻击）
+const SWEEP_BLOCK_STAMINA = 15  // 横扫破防额外体力扣除
+const ROAR_STAMINA = 25         // 嘶吼冲击波体力扣除
+const SWEEP_TRACK_S = 8         // 连续格挡统计窗口
 const COUNTER_WINDOW_S = 1.0      // 僵尸眩晕后反击窗口（与 zombie.ts 约定一致）
 const CHASE_WINDOW_S = 2.0
 const REACH = 3.0                 // 普攻命中距离
@@ -140,6 +144,8 @@ export class PlayerCombat {
 
 	private blockStart = 0
 	private blockCdUntil = 0
+	private guardBreakUntil = 0   // 横扫破防硬直截止
+	private blockTimes: number[] = [] // 成功格挡时间戳（横扫预约统计）
 	private stunnedUntil = 0
 	private lastStaminaUse = -10
 	private combo = -1            // 上一段连击索引（0/1/2 循环）
@@ -188,6 +194,7 @@ export class PlayerCombat {
 	 */
 	onLeftClick(now: number, zombies: Zombie[], camera: THREE.PerspectiveCamera): boolean {
 		if (this.stunnedUntil > now) return true
+		if (now < this.guardBreakUntil) return true // 破防硬直：无法攻击
 		if (this.blocking) this.endBlock(now)
 
 		// 反击：僵尸眩晕后 1s 窗口内
@@ -229,6 +236,7 @@ export class PlayerCombat {
 
 	startBlock(now: number): boolean {
 		if (this.stunnedUntil > now || this.blocking || now < this.blockCdUntil) return false
+		if (now < this.guardBreakUntil) return false // 破防硬直：无法格挡
 		this.blocking = true
 		this.blockStart = now
 		this.emitHud(true)
@@ -244,11 +252,15 @@ export class PlayerCombat {
 
 	// ---------------- 僵尸攻击结算（SceneManager 回调） ----------------
 
-	resolveStrike(z: Zombie, now: number, camera: THREE.PerspectiveCamera) {
-		if (this.hp <= 0) return
+	/**
+	 * 僵尸普攻落手结算。
+	 * 返回 true 表示 8s 内已成功格挡 2 次（SceneManager 应为该僵尸预约横扫）。
+	 */
+	resolveStrike(z: Zombie, now: number, camera: THREE.PerspectiveCamera): boolean {
+		if (this.hp <= 0) return false
 		if (this.stunnedUntil > now) {
 			this.hurt(10, now) // 眩晕中硬吃
-			return
+			return false
 		}
 		if (this.blocking) {
 			const age = now - this.blockStart
@@ -260,18 +272,76 @@ export class PlayerCombat {
 				this.hooks.onFlash('parry')
 				this.hooks.onToast('完美格挡！僵尸 −20 体力')
 				this.floatAtZombie(z, '−20 体力', true, camera)
+				return this.registerBlockSuccess(now)
 			} else if (Math.random() < 0.25) {
 				playSfx('unexactParry')
 				this.hurt(10, now)
 				this.hooks.onToast('格挡失败！')
+				return false
 			} else {
 				playSfx('unexactParry')
 				this.useStamina(10, now)
 				this.hooks.onToast('格挡成功（−10 体力）')
+				return this.registerBlockSuccess(now)
 			}
 		} else {
 			this.hurt(10, now)
+			return false
 		}
+	}
+
+	// ---------------- 僵尸技能结算（SceneManager 回调） ----------------
+
+	/**
+	 * 记录一次成功格挡（完美 / 不完美成功）。
+	 * 8s 内累计 2 次 → 返回 true，SceneManager 据此为僵尸预约横扫。
+	 */
+	registerBlockSuccess(now: number): boolean {
+		this.blockTimes.push(now)
+		while (this.blockTimes.length > 0 && now - this.blockTimes[0] > SWEEP_TRACK_S) this.blockTimes.shift()
+		return this.blockTimes.length >= 2
+	}
+
+	/** 横扫命中（无法格挡）：12 伤害；正在格挡则额外破防（-15 体力 + 硬直） */
+	handleSweepHit(z: Zombie, now: number, camera: THREE.PerspectiveCamera) {
+		const wasBlocking = this.blocking
+		this.hurt(12, now)
+		this.floatAtZombie(z, '−12', true, camera)
+		if (wasBlocking) {
+			this.blocking = false
+			this.guardBreakUntil = now + GUARD_BREAK_S
+			this.useStamina(SWEEP_BLOCK_STAMINA, now)
+			this.hooks.onToast('横扫破防！格挡被击碎')
+			playSfx('kick')
+		}
+	}
+
+	/** 突进命中：14 伤害 + 击退 + 打断挥剑 / 格挡（击退由 SceneManager 施加） */
+	handleLungeHit(z: Zombie, now: number, camera: THREE.PerspectiveCamera) {
+		this.hurt(14, now)
+		this.floatAtZombie(z, '−14', true, camera)
+		this.interruptAction(now)
+	}
+
+	/** 嘶吼冲击波命中（不掉血）：-25 体力 + 减速由 SceneManager 施加 */
+	handleRoarHit(z: Zombie, now: number, camera: THREE.PerspectiveCamera) {
+		this.useStamina(ROAR_STAMINA, now)
+		this.hooks.onFlash('hurt')
+		this.hooks.onToast('被嘶吼震慑！−25 体力')
+		this.floatAtZombie(z, '−25 体力', false, camera)
+	}
+
+	/** 打断当前动作（突进命中用）：取消挥剑与格挡 */
+	interruptAction(now: number) {
+		if (this.cur) {
+			this.cur = null
+			this.buffered = null
+		}
+		if (this.blocking) {
+			this.blocking = false
+			this.blockCdUntil = now + BLOCK_CD_S
+		}
+		this.emitHud(true)
 	}
 
 	// ---------------- 帧更新 ----------------
@@ -335,7 +405,7 @@ export class PlayerCombat {
 			blockCd01: Math.max(0, Math.min(1, cd)),
 			stunnedFor: Math.max(0, this.stunnedUntil - now),
 			chaseLeft: this.chaseLeft,
-			incomingAttack: zombies.some((z) => z.state === 'windup'),
+			incomingSkill: zombies.map((z) => z.telegraph).find(Boolean) ?? null,
 			target: t
 				? { hp: t.hp, maxHp: t.maxHp, stamina: t.stamina, maxStamina: t.maxStamina, vulnMul: t.vulnMul }
 				: null,

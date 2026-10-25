@@ -1,20 +1,37 @@
 /**
  * Minecraft 风格僵尸（方块人模型）+ 简易 AI 状态机
  *
- * enter（从门廊穿过门洞）→ chase（追击玩家）→ windup（1s 抬手前摇）
+ * enter（从门廊穿过门洞）→ chase（追击玩家）→ windup（抬手前摇，flash-alert 音效）
  * → 攻击（10 伤害，耗自身 10 体力）→ recover → 循环
  * 体力耗尽 → stunned 5s（前 1s 为玩家反击窗口）→ 体力回满继续
  * HP 归零 → dead（倒地淡出）
  *
+ * 技能（预警语言：金=可格挡普攻 / 白=不可格挡横扫 / 紫=位移突进 / 红圈=范围嘶吼）：
+ * - 横扫 sweep：combat 侧观察到玩家 8s 内成功格挡 2 次 → 置位 requestSweep，
+ *   近身时替换普攻：180° 扇形 12 伤害，无法格挡（破防：-15 体力 + 硬直）
+ * - 突进 lunge：玩家距离 2.5–5m 且冷却就绪时概率触发，蓄力后直线冲刺锁定落点，
+ *   命中 14 伤害 + 击退打断；冲空则自身僵直 1s（输出窗口）
+ * - 嘶吼 roar：体力 < 35 且冷却就绪（每场最多 2 次）：0.8s 前摇（可被 ≥15 伤害打断）
+ *   → 3m 冲击波：玩家 -25 体力 + 减速 1s，自身回 30 体力推迟眩晕
+ *
  * 边界与 SceneManager 门洞/门廊数值对齐（z 1.45–2.35 门洞，x<-3.5 为门廊）。
  */
 import * as THREE from 'three'
-import { getSfxDuration, playSfx } from './audio'
+import { getSfxDuration, playSfx, type SfxName } from './audio'
 
-export type ZombieState = 'enter' | 'chase' | 'windup' | 'recover' | 'stunned' | 'dead'
+export type ZombieState =
+  | 'enter' | 'chase' | 'windup' | 'recover' | 'stunned' | 'dead'
+  | 'sweep' | 'lungeWind' | 'lungeDash' | 'roar'
+
+/** 僵尸技能预警类型（驱动准星四角星颜色） */
+export type ZombieTelegraph = 'normal' | 'sweep' | 'lunge' | null
 
 export interface ZombieHooks {
-  onStrike(z: Zombie): void
+  onStrike(z: Zombie): void            // 普攻落手
+  onSweep(z: Zombie): void             // 横扫落手
+  onLunge(z: Zombie, dirX: number, dirZ: number): void // 突进命中（dirX/Z 为击退方向）
+  onRoar(z: Zombie): void              // 嘶吼冲击波命中
+  onRoarInterrupt(z: Zombie): void     // 嘶吼被打断
   onStun(z: Zombie): void
   onDeath(z: Zombie): void
 }
@@ -27,6 +44,22 @@ const RECOVER_S = 1.1         // 攻击后摇
 const STUN_S = 5.0            // 眩晕时长
 const ATTACK_COST = 10        // 每次攻击消耗体力
 
+// 技能参数
+const SWEEP_COST = 15         // 横扫体力消耗
+const SWEEP_CD = 8            // 横扫冷却 s
+const SWEEP_RANGE = 2.2       // 横扫判定半径
+const LUNGE_COST = 20         // 突进体力消耗
+const LUNGE_CD = 10           // 突进冷却 s
+const LUNGE_MIN = 2.5         // 突进触发最小距离
+const LUNGE_MAX = 5.0         // 突进触发最大距离
+const LUNGE_SPEED = 8.0       // 突进冲刺速度 m/s
+const LUNGE_HIT_R = 1.2       // 突进命中半径
+const LUNGE_TIMEOUT = 1.2     // 突进最长冲刺时间 s
+const ROAR_CD = 25            // 嘶吼冷却 s
+const ROAR_MAX_USES = 2       // 每场最多嘶吼次数
+const ROAR_HEAL = 30          // 嘶吼回体力
+const ROAR_RADIUS = 3.0       // 嘶吼冲击波半径
+
 export class Zombie {
   readonly group = new THREE.Group()
   hp = 500
@@ -36,9 +69,18 @@ export class Zombie {
   state: ZombieState = 'enter'
   stunnedAt = 0
   vulnMul = 0               // 眩晕易伤倍率（1.15~1.85，眩晕开始瞬间掷定，非眩晕时为 0）
+  requestSweep = false      // combat 侧检测到玩家连续格挡后置位 → 近身时替换普攻
   removeMe = false
   get dead(): boolean {
     return this.state === 'dead'
+  }
+
+  /** 当前技能预警类型（供 HUD 四角星变色） */
+  get telegraph(): ZombieTelegraph {
+    if (this.state === 'windup') return 'normal'
+    if (this.state === 'sweep') return 'sweep'
+    if (this.state === 'lungeWind') return 'lunge'
+    return null
   }
 
   private windT = 0
@@ -55,6 +97,15 @@ export class Zombie {
   private legL!: THREE.Group
   private legR!: THREE.Group
   private body!: THREE.Mesh
+  private ring!: THREE.Mesh             // 嘶吼地面预警圈
+  // 技能冷却 / 状态
+  private sweepCdUntil = 0
+  private lungeCdUntil = 0
+  private roarCdUntil = 0
+  private roarUses = 0
+  private dashTo = new THREE.Vector3()  // 突进锁定落点
+  private dashT = 0                     // 突进已冲刺时间
+  private recExtra = 0                  // 突进落空 / 嘶吼被打断的额外僵直
 
   private hooks: ZombieHooks
 
@@ -129,6 +180,16 @@ export class Zombie {
     mouth.castShadow = false
     head.add(mouth)
 
+    // 嘶吼地面预警圈（红色，默认隐藏）
+    this.ring = new THREE.Mesh(
+      new THREE.RingGeometry(ROAR_RADIUS - 0.28, ROAR_RADIUS, 48),
+      new THREE.MeshBasicMaterial({ color: 0xff3b30, transparent: true, opacity: 0, side: THREE.DoubleSide, depthWrite: false }),
+    )
+    this.ring.rotation.x = -Math.PI / 2
+    this.ring.position.y = 0.03
+    this.ring.visible = false
+    this.group.add(this.ring)
+
     this.group.scale.setScalar(0.95)
   }
 
@@ -150,6 +211,14 @@ export class Zombie {
     const dmg = this.vulnMul > 0 ? Math.round(n * this.vulnMul) : n
     this.hp = Math.max(0, this.hp - dmg)
     this.flashT = 0.12
+    // 嘶吼前摇中受到 ≥15 伤害 → 打断（踉跄后摇，奖励主动进攻）
+    if (this.state === 'roar' && dmg >= 15) {
+      this.hideRoarRing()
+      this.state = 'recover'
+      this.recT = 0
+      this.recExtra = 0.55
+      this.hooks.onRoarInterrupt(this)
+    }
     if (fromPos) {
       const pos = this.group.position
       const dx = pos.x - fromPos.x
@@ -194,6 +263,7 @@ export class Zombie {
 
     // 死亡：后仰倒地 → 淡出
     if (this.state === 'dead') {
+      this.hideRoarRing()
       this.deathT += dt
       const fall = Math.min(1, this.deathT / 0.5)
       this.group.rotation.x = -fall * 1.45
@@ -234,6 +304,17 @@ export class Zombie {
     const dz = playerPos.z - pos.z
     const dist = Math.hypot(dx, dz)
 
+    // 嘶吼触发：濒临眩晕时保命，优先于一切行动（chase / windup / recover 均可打断自身）
+    if (
+      (this.state === 'chase' || this.state === 'windup' || this.state === 'recover') &&
+      this.stamina < 35 && this.roarUses < ROAR_MAX_USES && now >= this.roarCdUntil
+    ) {
+      this.state = 'roar'
+      this.windT = 0
+      this.strikeAt = this.skillDur('roar', 0.8)
+      playSfx('roar')
+    }
+
     switch (this.state) {
       case 'enter': {
         // 穿过门洞进入室内
@@ -242,6 +323,19 @@ export class Zombie {
         break
       }
       case 'chase': {
+        // 技能优先级：横扫（combat 预约）> 突进（中距离概率触发）> 普攻
+        if (this.requestSweep && dist <= SWEEP_RANGE && now >= this.sweepCdUntil) {
+          this.requestSweep = false
+          this.startSkill('sweep', now)
+          break
+        }
+        if (
+          dist >= LUNGE_MIN && dist <= LUNGE_MAX && now >= this.lungeCdUntil &&
+          Math.random() < 1 - Math.exp(-1.6 * dt) // 约 1.6 次/s 的期望触发率，避免瞬时必发
+        ) {
+          this.startSkill('lunge', now)
+          break
+        }
         if (dist <= ATTACK_RANGE) {
           this.state = 'windup'
           this.windT = 0
@@ -271,23 +365,120 @@ export class Zombie {
           if (dist <= STRIKE_RANGE && Math.abs(playerPos.y - 1.0) < 2.2) {
             this.hooks.onStrike(this)
           }
-          this.stamina -= ATTACK_COST
-          if (this.stamina <= 0) {
-            this.state = 'stunned'
-            this.stunnedAt = now
-            // 易伤倍率：眩晕开始的一瞬间掷定，本次眩晕期间不变（+15%~85%）
-            this.vulnMul = Math.round((1.15 + Math.random() * 0.7) * 100) / 100
-            this.hooks.onStun(this)
-            return
-          }
+          if (this.spendStamina(ATTACK_COST, now)) return
           this.state = 'recover'
           this.recT = 0
+          this.recExtra = 0
+        }
+        break
+      }
+      case 'sweep': {
+        // 横扫前摇：双臂横向张开
+        this.windT += dt
+        this.faceTo(dx, dz, dt)
+        const p = Math.min(1, this.windT / this.strikeAt)
+        this.armL.rotation.x = -1.35
+        this.armR.rotation.x = -1.35
+        this.armL.rotation.z = p * 1.25
+        this.armR.rotation.z = -p * 1.25
+        this.body.rotation.y = Math.sin(p * Math.PI) * 0.35
+        if (this.windT >= this.strikeAt) {
+          this.armL.rotation.z = 0
+          this.armR.rotation.z = 0
+          this.body.rotation.y = 0
+          // 180° 扇形判定：面向玩家方向 ±90°（无法格挡，由 combat 结算破防）
+          let diff = Math.abs(Math.atan2(dx, dz) - this.yaw)
+          while (diff > Math.PI) diff = Math.abs(diff - Math.PI * 2)
+          if (diff <= Math.PI / 2 + 0.15 && dist <= SWEEP_RANGE && playerPos.y - 1.0 < 1.8) {
+            this.hooks.onSweep(this)
+          }
+          if (this.spendStamina(SWEEP_COST, now)) return
+          this.sweepCdUntil = now + SWEEP_CD
+          this.state = 'recover'
+          this.recT = 0
+          this.recExtra = 0
+        }
+        break
+      }
+      case 'lungeWind': {
+        // 蓄力：压低身体蹲伏
+        this.windT += dt
+        this.faceTo(dx, dz, dt)
+        const p = Math.min(1, this.windT / this.strikeAt)
+        this.body.rotation.x = 0.5 * p
+        this.legL.rotation.x = 0.65 * p
+        this.legR.rotation.x = 0.65 * p
+        this.armL.rotation.x = -0.2 * p
+        this.armR.rotation.x = -0.2 * p
+        if (this.windT >= this.strikeAt) {
+          // 锁定当前位置为冲刺落点，直线冲刺
+          this.dashTo.set(playerPos.x, 0, playerPos.z)
+          this.dashT = 0
+          this.state = 'lungeDash'
+        }
+        break
+      }
+      case 'lungeDash': {
+        // 冲刺：超高速直线移动，途中接触即命中
+        this.dashT += dt
+        this.faceTo(dx, dz, dt)
+        const rdx = this.dashTo.x - pos.x
+        const rdz = this.dashTo.z - pos.z
+        const remain = Math.hypot(rdx, rdz)
+        const step = Math.min(LUNGE_SPEED * dt, remain)
+        if (remain > 1e-3) {
+          pos.x += (rdx / remain) * step
+          pos.z += (rdz / remain) * step
+        }
+        // 冲刺姿态：双臂前伸 + 前倾
+        this.armL.rotation.x = -1.6
+        this.armR.rotation.x = -1.6
+        this.body.rotation.x = 0.35
+        const hitPlayer = Math.hypot(dx, dz) <= LUNGE_HIT_R && Math.abs(playerPos.y - 1.0) < 2.2
+        if (hitPlayer) {
+          this.hooks.onLunge(this, dx / (Math.hypot(dx, dz) || 1), dz / (Math.hypot(dx, dz) || 1))
+        }
+        if (hitPlayer || remain <= 0.05 || this.dashT >= LUNGE_TIMEOUT) {
+          // 命中或冲空：耗体力，冲空给玩家 1s 输出窗口（额外僵直）
+          if (this.spendStamina(LUNGE_COST, now)) return
+          this.lungeCdUntil = now + LUNGE_CD
+          this.state = 'recover'
+          this.recT = 0
+          this.recExtra = hitPlayer ? 0 : 0.55
+        }
+        break
+      }
+      case 'roar': {
+        // 嘶吼前摇：后仰张嘴 + 地面红圈扩张
+        this.windT += dt
+        this.faceTo(dx, dz, dt)
+        const p = Math.min(1, this.windT / this.strikeAt)
+        this.body.rotation.x = -0.45 * p
+        this.armL.rotation.x = 0.45 * p
+        this.armR.rotation.x = 0.45 * p
+        this.ring.visible = true
+        const rm = this.ring.material as THREE.MeshBasicMaterial
+        rm.opacity = 0.25 + 0.5 * p
+        this.ring.scale.setScalar(0.35 + 0.65 * p)
+        if (this.windT >= this.strikeAt) {
+          this.hideRoarRing()
+          if (dist <= ROAR_RADIUS) this.hooks.onRoar(this)
+          // 自身回体力推迟眩晕
+          this.stamina = Math.min(this.maxStamina, this.stamina + ROAR_HEAL)
+          this.roarUses++
+          this.roarCdUntil = now + ROAR_CD
+          this.state = 'recover'
+          this.recT = 0
+          this.recExtra = 0
         }
         break
       }
       case 'recover': {
         this.recT += dt
-        if (this.recT >= RECOVER_S) this.state = 'chase'
+        if (this.recT >= RECOVER_S + this.recExtra) {
+          this.recExtra = 0
+          this.state = 'chase'
+        }
         break
       }
     }
@@ -316,6 +507,46 @@ export class Zombie {
   }
 
   // ---------------- 私有 ----------------
+
+  /** 技能前摇时长：对齐音效时长（声音结束即结算），下限 0.5s */
+  private skillDur(name: SfxName, fallback: number) {
+    return Math.max(getSfxDuration(name) ?? fallback, 0.5)
+  }
+
+  /** 开始技能前摇：播放对应音效并设定前摇时长 */
+  private startSkill(kind: 'sweep' | 'lunge', now: number) {
+    void now
+    if (kind === 'sweep') {
+      playSfx('sweep')
+      this.strikeAt = this.skillDur('sweep', 1.2)
+      this.state = 'sweep'
+    } else {
+      playSfx('lunge')
+      this.strikeAt = this.skillDur('lunge', 0.6)
+      this.state = 'lungeWind'
+    }
+    this.windT = 0
+  }
+
+  /** 消耗体力，耗尽则进入眩晕（掷定易伤倍率），返回是否已眩晕 */
+  private spendStamina(n: number, now: number): boolean {
+    this.stamina = Math.max(0, this.stamina - n)
+    if (this.stamina <= 0) {
+      this.state = 'stunned'
+      this.stunnedAt = now
+      // 易伤倍率：眩晕开始的一瞬间掷定，本次眩晕期间不变（+15%~85%）
+      this.vulnMul = Math.round((1.15 + Math.random() * 0.7) * 100) / 100
+      this.hooks.onStun(this)
+      return true
+    }
+    return false
+  }
+
+  private hideRoarRing() {
+    this.ring.visible = false
+    ;(this.ring.material as THREE.MeshBasicMaterial).opacity = 0
+    this.ring.scale.setScalar(0.35)
+  }
 
   private moveToward(tx: number, tz: number, dt: number, speed: number) {
     const pos = this.group.position

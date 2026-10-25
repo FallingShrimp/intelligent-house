@@ -97,6 +97,7 @@ export class SceneManager {
 	private sprinting = false       // 疾跑状态（双击并按住 W）
 	private keys = new Set<string>()
 	private vel = new THREE.Vector3() // 世界系速度（水平惯性 + 垂直速度），由 dt 积分
+	private slowUntil = 0           // 嘶吼减速截止时刻（loop 秒钟）
 	private lastTime = 0
 	private disposed = false
 	private onModeChange?: (mode: ViewMode) => void
@@ -440,7 +441,25 @@ export class SceneManager {
 			return
 		}
 		const z = new Zombie({
-			onStrike: (zb) => this.combat.resolveStrike(zb, this.lastTime, this.camera),
+			onStrike: (zb) => {
+				// 返回 true：玩家 8s 内成功格挡 2 次 → 为该僵尸预约横扫（破格挡技）
+				if (this.combat.resolveStrike(zb, this.lastTime, this.camera)) {
+					zb.requestSweep = true
+					this.onToast?.('僵尸盯上了你的格挡——横扫将至！')
+				}
+			},
+			onSweep: (zb) => this.combat.handleSweepHit(zb, this.lastTime, this.camera),
+			onLunge: (zb, dirX, dirZ) => {
+				this.combat.handleLungeHit(zb, this.lastTime, this.camera)
+				// 击退：沿突进方向施加速度脉冲（靠摩擦自然滑出约 2m）
+				this.vel.x += dirX * 6.5
+				this.vel.z += dirZ * 6.5
+			},
+			onRoar: (zb) => {
+				this.combat.handleRoarHit(zb, this.lastTime, this.camera)
+				this.slowUntil = this.lastTime + 1.0 // 嘶吼减速 1s
+			},
+			onRoarInterrupt: () => this.onToast?.('嘶吼被打断！'),
 			onStun: () => this.onToast?.('僵尸眩晕了！1 秒内左键反击！'),
 			onDeath: () => this.onToast?.('僵尸被击倒了！'),
 		})
@@ -557,8 +576,9 @@ export class SceneManager {
 		const hasInput = forward !== 0 || strafe !== 0
 		// 疾跑仅在按住 W 前进时维持
 		if (this.sprinting && forward <= 0) this.sprinting = false
-		const maxSpeed = this.sprinting ? SPRINT_SPEED : MAX_SPEED
-		const accel = this.sprinting ? SPRINT_ACCEL : ACCEL_H
+		const slow = this.lastTime < this.slowUntil ? 0.5 : 1 // 嘶吼减速
+		const maxSpeed = (this.sprinting ? SPRINT_SPEED : MAX_SPEED) * slow
+		const accel = (this.sprinting ? SPRINT_ACCEL : ACCEL_H) * slow
 		if (hasInput) {
 			const dir = new THREE.Vector3()
 			this.camera.getWorldDirection(dir)

@@ -113,9 +113,15 @@ onBeforeUnmount(() => {
       <span class="tick l"></span>
       <span class="tick r"></span>
     </div>
-    <!-- 僵尸攻击预警：金色四角星（准星上方：点放大→成型→继续放大渐隐循环） -->
-    <svg v-if="locked && hud && hud.incomingAttack" class="attack-alert" viewBox="0 0 24 24" width="46" height="46">
-      <path d="M12 0 L14.6 9.4 L24 12 L14.6 14.6 L12 24 L9.4 14.6 L0 12 L9.4 9.4 Z" fill="#ffd76a" stroke="#b8791a" stroke-width="0.6" />
+    <!-- 僵尸技能预警四角星（准星上方：点放大→成型→继续放大渐隐循环）
+         金=可格挡普攻 / 白=不可格挡横扫（必须闪避）/ 紫=突进位移 -->
+    <svg
+      v-if="locked && hud && hud.incomingSkill"
+      class="attack-alert"
+      :class="hud.incomingSkill"
+      viewBox="0 0 24 24" width="46" height="46"
+    >
+      <path d="M12 0 L14.6 9.4 L24 12 L14.6 14.6 L12 24 L9.4 14.6 L0 12 L9.4 9.4 Z" stroke-width="0.6" />
     </svg>
     <!-- 格挡进度 / 冷却（准星下方） -->
     <div v-if="locked && hud" class="block-meter">

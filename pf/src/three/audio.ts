@@ -11,6 +11,9 @@ import counter2Url from '../assets/audio/counter-attack-2.wav'
 import dashUrl from '../assets/audio/dash.wav'
 import flashAlertUrl from '../assets/audio/flash-alert.wav'
 import kickUrl from '../assets/audio/kick.wav'
+import sweepUrl from '../assets/audio/sweep.wav'
+import lungeUrl from '../assets/audio/lunge.wav'
+import roarUrl from '../assets/audio/roar.mp3'
 
 export type SfxName =
   | 'swing'          // 三段普通攻击挥砍
@@ -22,6 +25,9 @@ export type SfxName =
   | 'dash'           // 闪避
   | 'flashAlert'     // 僵尸攻击前摇预警（时长即前摇时长）
   | 'kick'           // 玩家受伤
+  | 'sweep'          // 僵尸横扫（时长即前摇时长）
+  | 'lunge'          // 僵尸突进蓄力（时长即前摇时长）
+  | 'roar'           // 僵尸嘶吼（时长即前摇时长）
 
 const URLS: Record<SfxName, string> = {
   swing: swingUrl,
@@ -33,21 +39,28 @@ const URLS: Record<SfxName, string> = {
   dash: dashUrl,
   flashAlert: flashAlertUrl,
   kick: kickUrl,
+  sweep: sweepUrl,
+  lunge: lungeUrl,
+  roar: roarUrl,
 }
 
 // ---------------- 时长预量取（用于前摇与音效对齐） ----------------
 
 const durations = new Map<SfxName, number>()
 
-// 启动即探测 flash-alert 时长：loadedmetadata 后缓存，僵尸攻击前摇按该时长判定，
-// 保证「声音结束 → 伤害结算」精确同步。元数据未就绪时回退调用方默认值。
-const flashAlertProbe = new Audio(flashAlertUrl)
-flashAlertProbe.addEventListener(
-  'loadedmetadata',
-  () => durations.set('flashAlert', flashAlertProbe.duration),
-  { once: true },
-)
-flashAlertProbe.load()
+// 探测需要与攻击前摇对齐的音效时长：loadedmetadata 后缓存，
+// 前摇按该时长判定，保证「声音结束 → 伤害结算」精确同步。
+// 元数据未就绪时回退调用方默认值。
+for (const [name, url] of [
+  ['flashAlert', flashAlertUrl],
+  ['sweep', sweepUrl],
+  ['lunge', lungeUrl],
+  ['roar', roarUrl],
+] as const) {
+  const probe = new Audio(url)
+  probe.addEventListener('loadedmetadata', () => durations.set(name, probe.duration), { once: true })
+  probe.load()
+}
 
 export function getSfxDuration(name: SfxName): number | undefined {
   return durations.get(name)
