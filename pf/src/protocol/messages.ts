@@ -118,13 +118,88 @@ export interface HelloPayload {
   role: Role;
   client_name: string;
   client_version: string;
+  /** 联机对战：PF 必须携带玩家名（localStorage DisplayName） */
+  display_name?: string;
+}
+
+export interface PlayerYou {
+  uuid: string;
+  name: string;
+  color: string;
 }
 
 export interface WelcomePayload {
   client_id: string;
   server_ts: number;
   snapshot: StateSnapshotPayload;
+  /** 联机对战：本客户端的玩家身份 */
+  you?: PlayerYou;
 }
+
+// ---------- 联机对战（PB 权威世界模拟） ----------
+
+/** PF → PB 输入状态（10Hz） */
+export interface MpInputPayload {
+  p: [number, number, number];
+  yaw: number;
+  dir: [number, number];
+  mode: 'fp' | 'free';
+  door_open: boolean;
+  anim?: string | null;
+}
+
+/** PF → PB 动作意图 */
+export interface MpActionPayload {
+  kind: 'attack' | 'parry_start' | 'parry_stop';
+  segment?: number;
+}
+
+export type ZNetState =
+  | 'enter' | 'chase' | 'windup' | 'recover' | 'stunned' | 'dead'
+  | 'sweep' | 'lungeWind' | 'lungeDash' | 'roar';
+
+export interface NetPlayerState {
+  uuid: string; name: string; color: string;
+  p: [number, number, number]; yaw: number;
+  fp: boolean;
+  hp: number; st: number;
+  stun_for: number;
+  blocking: boolean;
+  anim: string | null;
+}
+
+export interface NetZombieState {
+  id: number;
+  p: [number, number, number]; yaw: number;
+  hp: number; st: number;
+  state: ZNetState; st_t: number; windup_dur: number;
+  vuln: number;
+  target: boolean;
+}
+
+/** PB → PF 世界快照（10Hz） */
+export interface WorldPayload {
+  t: number;
+  chase_left: number;
+  players: NetPlayerState[];
+  zombies: NetZombieState[];
+}
+
+/** PB → PF 战斗事件（伤害 / 格挡 / 眩晕 / 击退等，瞬时效果触发） */
+export type MpEventPayload =
+  | { kind: 'join'; uuid: string; name: string; color: string }
+  | { kind: 'leave'; uuid: string; name: string }
+  | { kind: 'dmg_z'; id: number; amount: number; crit: boolean; by: string }
+  | { kind: 'dmg_p'; uuid: string; amount: number; by: string; interrupt: boolean }
+  | { kind: 'parry'; uuid: string; perfect: boolean; fail: boolean; drain: number; byZombie: boolean }
+  | { kind: 'zstun'; id: number; mul: number }
+  | { kind: 'zdie'; id: number }
+  | { kind: 'knockback'; uuid: string; dx: number; dz: number; speed: number }
+  | { kind: 'slow'; uuid: string; dur: number }
+  | { kind: 'guardbreak'; uuid: string; dur: number }
+  | { kind: 'respawn'; uuid: string }
+  | { kind: 'counter_open' }
+  | { kind: 'roar_interrupt'; id: number };
 
 export interface HeartbeatPayload {
   acq_connected: boolean;
@@ -237,10 +312,17 @@ export interface DecodeStatusMsg extends BaseMessage { type: 'decode_status'; pa
 
 export interface StateRequestMsg extends BaseMessage { type: 'state_request'; payload: StateRequestPayload; }
 export interface UiCommandMsg extends BaseMessage { type: 'ui_command'; payload: UiCommandPayload; }
+export interface MpInputMsg extends BaseMessage { type: 'mp_input'; payload: MpInputPayload; }
+export interface MpActionMsg extends BaseMessage { type: 'mp_action'; payload: MpActionPayload; }
 
 // ---- PB → SCB ----
 
 export interface ConfigUpdateMsg extends BaseMessage { type: 'config_update'; payload: ConfigUpdatePayload; }
+
+// ---- PB → PF（联机对战） ----
+
+export interface WorldMsg extends BaseMessage { type: 'world'; payload: WorldPayload; }
+export interface EventMsg extends BaseMessage { type: 'event'; payload: MpEventPayload; }
 
 // ---------- 5. 通道消息集合 ----------
 
@@ -249,9 +331,9 @@ export type FromScb = HelloMsg | HeartbeatMsg | DeviceCommandMsg | DecodeStatusM
 /** PB 视角：发送给 SCB */
 export type ToScb = WelcomeMsg | CommandAckMsg | DeviceStateUpdateMsg | StateSnapshotMsg | ConfigUpdateMsg | ErrorMsg;
 /** PB 视角：从 PF 接收 */
-export type FromPf = HelloMsg | StateRequestMsg | UiCommandMsg;
+export type FromPf = HelloMsg | StateRequestMsg | UiCommandMsg | MpInputMsg | MpActionMsg;
 /** PB 视角：发送给 PF */
-export type ToPf = WelcomeMsg | StateSnapshotMsg | DeviceStateUpdateMsg | CommandAckMsg | ErrorMsg;
+export type ToPf = WelcomeMsg | StateSnapshotMsg | DeviceStateUpdateMsg | CommandAckMsg | ErrorMsg | WorldMsg | EventMsg;
 
 /** 按类型收窄消息（PF 侧常用） */
 export function isType<T extends ToPf['type']>(msg: ToPf, type: T): msg is Extract<ToPf, { type: T }> {

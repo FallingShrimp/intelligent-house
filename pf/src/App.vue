@@ -6,6 +6,7 @@
  */
 import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import DevicePanel from './components/DevicePanel.vue'
+import DisplayNameModal from './components/DisplayNameModal.vue'
 import EmergencyBanner from './components/EmergencyBanner.vue'
 import MockCommandPanel from './components/MockCommandPanel.vue'
 import StatusBar from './components/StatusBar.vue'
@@ -21,6 +22,14 @@ const viewMode = ref<ViewMode>('fixed')
 const flying = ref(false)
 const locked = ref(false)
 const toast = ref('')
+// 联机对战：首次连接（localStorage 无 DisplayName）时弹出名字输入框
+const needName = ref(!localStorage.getItem('DisplayName'))
+function confirmName(name: string) {
+  localStorage.setItem('DisplayName', name)
+  pbClient.setDisplayName(name)
+  pbClient.connect()
+  needName.value = false
+}
 let toastTimer = 0
 function showToast(msg: string) {
   toast.value = msg
@@ -162,6 +171,7 @@ onBeforeUnmount(() => {
       <div class="stun-text">眩晕 {{ hud.stunnedFor.toFixed(1) }}s</div>
     </div>
     <EmergencyBanner />
+    <DisplayNameModal v-if="needName" @confirm="confirmName" />
     <MockCommandPanel />
     <DevicePanel />
     <StatusBar />

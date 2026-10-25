@@ -174,12 +174,38 @@ async function main(): Promise<void> {
     })) && ok
 
   ok =
-    (await step('PF 连接 /ws/pf + hello → welcome（角色隔离通过）', async () => {
+    (await step('PF 连接 /ws/pf + hello（带 display_name）→ welcome（client_id + you 身份）', async () => {
       pf = await connect('/ws/pf')
-      send(pf, 'hello', 1, { role: 'pf', client_name: 'smoke-pf', client_version: '0.1.0' })
+      send(pf, 'hello', 1, {
+        role: 'pf',
+        client_name: 'smoke-pf',
+        client_version: '0.1.0',
+        display_name: 'smoke-player',
+      })
       const welcome = await recv(pf, 'welcome')
       assert(welcome.payload.snapshot.devices.length === 7, 'PF welcome 快照 7 台设备')
       assert(welcome.payload.client_id.startsWith('pf-'), 'pf client_id 分配')
+      // 联机对战：hello 携带 display_name → 分配 uuid + 随机颜色
+      const you = welcome.payload.you
+      assert(you && typeof you.uuid === 'string' && you.uuid.length > 10, '联机身份 uuid 已分配')
+      assert(you.name === 'smoke-player', `玩家名回显: ${you.name}`)
+      assert(typeof you.color === 'string' && you.color.startsWith('hsl('), `随机颜色: ${you.color}`)
+    })) && ok
+
+  ok =
+    (await step('联机约束：PF hello 缺 display_name → error(INVALID_FORMAT) 并断开', async () => {
+      const anon = await connect('/ws/pf')
+      send(anon, 'hello', 1, { role: 'pf', client_name: 'anon-pf', client_version: '0.1.0' })
+      const err = await recv(anon, 'error')
+      assert(err.payload.code === 'INVALID_FORMAT', 'code=INVALID_FORMAT')
+      assert(String(err.payload.message).includes('display_name'), '错误消息提示 display_name')
+      await Promise.race([
+        anon.closedPromise,
+        sleep(1500).then(() => {
+          throw new Error('连接未被服务端断开')
+        }),
+      ])
+      assert(anon.closed, '服务端已断开缺名连接')
     })) && ok
 
   ok =

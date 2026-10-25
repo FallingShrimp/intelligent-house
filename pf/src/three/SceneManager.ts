@@ -10,21 +10,24 @@
  * - 鼠标左键场景交互：开门（仅解锁）/ 开关电视 / 开关空调 / 喝水
  *   （电视、空调经 ui_command 走 PB 状态机同步；门校验后端 locked 状态，
  *    门板开合与水位为本地视觉动画——协议中无对应状态字段）
- * - 近战格斗（combat.ts / zombie.ts / sword.ts）：钻石剑三段连击、右键格挡、
- *   开门在门廊生成僵尸（追击 / 1s 前摇攻击 / 眩晕 / 死亡），左键优先攻击、
- *   无目标回落交互；HUD 经 CombatUiHooks 推给 App.vue
+ * - 近战格斗（combat.ts / zombie.ts / sword.ts）：PB 权威联机对战——僵尸 AI 状态机
+ *   与伤害裁决全部在 PB（world.ts，10Hz world 快照 + 瞬时 event），PF 只做本地
+ *   剑动画 / 意图上报（mp_action）/ 快照插值渲染；远程玩家渲染为彩色圆柱体
+ *   （RemotePlayers.ts）；左键优先攻击、无目标回落交互；HUD 经 CombatUiHooks 推给 App.vue
  * - 对外提供 applyDeviceState()，由 App.vue watch Pinia store 调用
  */
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { PointerLockControls } from 'three/examples/jsm/controls/PointerLockControls.js'
 import { playSfx } from './audio'
-import type { Action, DeviceId, DeviceState } from '../protocol/messages'
+import type { Action, DeviceId, DeviceState, MpEventPayload, WorldPayload, ZNetState } from '../protocol/messages'
+import { pbClient } from '../ws/client'
 import { PlayerCombat, type CombatHud } from './combat'
 import { buildDevices, type DeviceRigs } from './devices'
 import { buildRoom, type RoomRig } from './room'
+import { RemotePlayers } from './RemotePlayers'
 import { TweenSystem } from './tween'
-import { Zombie } from './zombie'
+import { NetZombie } from './zombie'
 
 export type ViewMode = 'fixed' | 'walk'
 
@@ -78,7 +81,7 @@ const DASH_CD = 0.6             // 闪避冷却 s
 /** 场景交互参数 */
 const CLICK_MOVE_PX = 6       // 按下-抬起位移小于该值视为点击（区分拖拽视角）
 const WATER_REFILL_S = 30     // 喝完水后自动续满间隔（秒）
-const MAX_ZOMBIES = 3         // 场上僵尸上限（开门生成）
+const MP_INPUT_PERIOD = 0.1   // 联机输入上报周期 s（10Hz）
 
 export class SceneManager {
 	private renderer: THREE.WebGLRenderer
@@ -116,10 +119,13 @@ export class SceneManager {
 	private waterEmpty = false      // 水杯是否已喝空（本地状态）
 	private waterRefillAt = 0       // 续水时刻（loop 秒钟）
 
-	// ---------------- 格斗系统状态 ----------------
+	// ---------------- 格斗 / 联机状态 ----------------
 	private combatHooks?: CombatUiHooks
 	private combat: PlayerCombat
-	private zombies: Zombie[] = []
+	private zombies: NetZombie[] = []
+	private remotePlayers = new RemotePlayers()
+	private lastMpSent = 0              // 上次输入上报时刻（loop 秒钟）
+	private pendingPerfect: number | null = null // 完美格挡音效延迟判定（等 zstun 判体力耗尽）
 
 	constructor(
 		host: HTMLElement,
@@ -163,22 +169,19 @@ export class SceneManager {
 		// 相机加入场景：第一人称剑视模型作为相机子物体需参与渲染
 		this.scene.add(this.camera)
 
-		// ---------------- 格斗系统（钻石剑视模型挂在相机上） ----------------
+		// ---------------- 格斗系统（钻石剑视模型挂在相机上，PB 权威裁决） ----------------
 		this.combat = new PlayerCombat({
 			onHud: () => this.combatHooks?.onHud(this.combat.getHud(this.zombies, this.camera)),
 			onToast: (t) => this.onToast?.(t),
 			onFloat: (text, sx, sy, crit) => this.combatHooks?.onFloat(text, sx, sy, crit),
 			onFlash: (k) => this.combatHooks?.onFlash(k),
-			onRespawn: () => {
-				this.camera.position.copy(WALK_SPAWN)
-				this.vel.set(0, 0, 0)
-				if (this.flying) {
-					this.flying = false
-					this.onFlyChange?.(false)
-				}
-			},
 		})
 		this.combat.attach(this.camera)
+
+		// ---------------- 联机对战（PB world 快照渲染 + 事件表现） ----------------
+		this.scene.add(this.remotePlayers.group)
+		pbClient.onWorld = (w) => this.applyWorld(w)
+		pbClient.onMpEvent = (e) => this.handleMpEvent(e)
 
 		// ---------------- 静态房间与设备 ----------------
 		this.room = buildRoom(this.scene)
@@ -268,6 +271,10 @@ export class SceneManager {
 		this.renderer.domElement.removeEventListener('contextmenu', this.handleContextMenu)
 		for (const z of this.zombies) this.scene.remove(z.group)
 		this.zombies = []
+		this.remotePlayers.dispose()
+		pbClient.onWorld = undefined
+		pbClient.onMpEvent = undefined
+		if (this.pendingPerfect !== null) window.clearTimeout(this.pendingPerfect)
 		this.combat.dispose()
 		this.orbit.dispose()
 		this.lockCtl.dispose()
@@ -345,7 +352,7 @@ export class SceneManager {
 		if (moved > CLICK_MOVE_PX) return // 拖拽视角，非点击
 		// 第一人称锁定：左键优先攻击（反击 > 追击 > 三段连击），无目标时回落到场景交互
 		if (this.mode === 'walk' && this.lockCtl.isLocked) {
-			const consumed = this.combat.onLeftClick(this.lastTime, this.zombies, this.camera)
+			const consumed = this.combat.onLeftClick(this.lastTime, this.zombies, this.remotePlayers.centers(), this.camera)
 			if (consumed) return
 			const tag = this.pickInteractable()
 			if (tag) {
@@ -414,8 +421,7 @@ export class SceneManager {
 				this.doorOpen = !this.doorOpen
 				this.rigs.setDoorOpen(this.doorOpen)
 				this.onToast?.(this.doorOpen ? '开门' : '关门')
-				// 每次开门：门后小房间（门廊）里钻出一只僵尸
-				if (this.doorOpen) this.spawnZombie()
+				// 僵尸生成由 PB 统一裁决（door_open 经 mp_input 10Hz 上报）
 				break
 			}
 			case 'water': {
@@ -434,39 +440,162 @@ export class SceneManager {
 		}
 	}
 
-	/** 开门时在门廊生成僵尸（上限 3 只同时在场） */
-	private spawnZombie() {
-		if (this.zombies.filter((z) => !z.dead).length >= MAX_ZOMBIES) {
-			this.onToast?.('门外已经站满了僵尸……')
-			return
-		}
-		const z = new Zombie({
-			onStrike: (zb) => {
-				// 返回 true：玩家 8s 内成功格挡 2 次 → 为该僵尸预约横扫（破格挡技）
-				if (this.combat.resolveStrike(zb, this.lastTime, this.camera)) {
-					zb.requestSweep = true
-					this.onToast?.('僵尸盯上了你的格挡——横扫将至！')
-				}
-			},
-			onSweep: (zb) => this.combat.handleSweepHit(zb, this.lastTime, this.camera),
-			onLunge: (zb, dirX, dirZ) => {
-				this.combat.handleLungeHit(zb, this.lastTime, this.camera)
-				// 击退：沿突进方向施加速度脉冲（靠摩擦自然滑出约 2m）
-				this.vel.x += dirX * 6.5
-				this.vel.z += dirZ * 6.5
-			},
-			onRoar: (zb) => {
-				this.combat.handleRoarHit(zb, this.lastTime, this.camera)
-				this.slowUntil = this.lastTime + 1.0 // 嘶吼减速 1s
-			},
-			onRoarInterrupt: () => this.onToast?.('嘶吼被打断！'),
-			onStun: () => this.onToast?.('僵尸眩晕了！1 秒内左键反击！'),
-			onDeath: () => this.onToast?.('僵尸被击倒了！'),
+	// ---------------- 联机对战：PB 快照 / 事件 → 本地表现 ----------------
+
+	/** 上报输入状态（10Hz）：位置 / 朝向 / 模式 / 门状态 / 当前动作标签 */
+	private sendMpInput() {
+		const euler = new THREE.Euler().setFromQuaternion(this.camera.quaternion, 'YXZ')
+		const dir = new THREE.Vector3()
+		this.camera.getWorldDirection(dir)
+		const len = Math.hypot(dir.x, dir.z) || 1
+		pbClient.sendMpInput({
+			p: [r3(this.camera.position.x), r3(this.camera.position.y), r3(this.camera.position.z)],
+			yaw: r3(euler.y),
+			dir: [r3(dir.x / len), r3(dir.z / len)],
+			mode: this.mode === 'walk' ? 'fp' : 'free',
+			door_open: this.doorOpen && !this.doorLocked,
+			anim: this.combat.currentAnimTag(),
 		})
-		z.group.position.set(-4.55, 0, 1.9) // 门廊内（门后小房间）
-		this.scene.add(z.group)
-		this.zombies.push(z)
-		this.onToast?.('门后传来低吼——一只僵尸钻了出来！')
+	}
+
+	/** world 快照应用：远程玩家增删 / 僵尸状态机渲染 / 自己的权威数值 */
+	private applyWorld(w: WorldPayload) {
+		// 自己的圆柱体不渲染（避免遮挡第一人称视角），数据仍经 mine 用于 HUD
+		this.remotePlayers.applySnapshot(w.players, pbClient.you?.uuid ?? null)
+
+		const seen = new Set<number>()
+		for (const s of w.zombies) {
+			seen.add(s.id)
+			let z = this.zombies.find((x) => x.id === s.id)
+			if (!z) {
+				// 快照尾巴里的尸体不再重建（PF 死亡动画 1.7s 早于 PB 2s 清理）
+				if (s.state === 'dead') continue
+				z = new NetZombie(s.id, s, (from, to) => this.onZombieStateChange(from, to))
+				this.scene.add(z.group)
+				this.zombies.push(z)
+			}
+			z.applyState(s)
+		}
+		for (let i = this.zombies.length - 1; i >= 0; i--) {
+			if (!seen.has(this.zombies[i].id)) {
+				this.zombies[i].dispose()
+				this.zombies.splice(i, 1)
+			}
+		}
+
+		const me = pbClient.you
+		const mine = me ? w.players.find((p) => p.uuid === me.uuid) : null
+		if (mine) this.combat.setNet(mine.hp, mine.st, mine.stun_for, w.chase_left)
+	}
+
+	/** 僵尸状态切换 → 前摇预警音效（金=普攻 / 白=横扫 / 紫=突进 / 红圈=嘶吼） */
+	private onZombieStateChange(_from: ZNetState, to: ZNetState) {
+		if (to === 'windup') playSfx('flashAlert')
+		else if (to === 'sweep') playSfx('sweep')
+		else if (to === 'lungeWind') playSfx('lunge')
+		else if (to === 'roar') playSfx('roar')
+	}
+
+	/** PB 战斗事件分发：音效 / 飘字 / 闪光 / 击退 / 减速 / 复位 */
+	private handleMpEvent(e: MpEventPayload) {
+		const me = pbClient.you?.uuid
+		switch (e.kind) {
+			case 'join':
+				if (e.uuid !== me) this.onToast?.(`${e.name} 加入了房间`)
+				break
+			case 'leave':
+				if (e.uuid !== me) this.onToast?.(`${e.name} 离开了房间`)
+				break
+			case 'dmg_z': {
+				const z = this.zombies.find((x) => x.id === e.id)
+				if (z) {
+					z.flash()
+					this.combat.pushFloat(z.headPos, `${Math.round(e.amount)}${e.crit ? '!' : ''}`, e.crit)
+				}
+				break
+			}
+			case 'dmg_p': {
+				if (e.uuid === me) {
+					playSfx('kick')
+					this.combatHooks?.onFlash('hurt')
+					const pos = this.camera.position.clone()
+					pos.y += 0.3
+					this.combat.pushFloat(pos, `-${Math.round(e.amount)}`, false)
+				} else {
+					this.remotePlayers.flash(e.uuid)
+					const c = this.remotePlayers.centers().find((c) => c.uuid === e.uuid)
+					if (c) this.combat.pushFloat(new THREE.Vector3(c.x, 2.0, c.z), `-${Math.round(e.amount)}`, false)
+				}
+				break
+			}
+			case 'parry': {
+				if (e.uuid !== me) break
+				if (e.fail) {
+					playSfx('unexactParry')
+					this.combatHooks?.onFlash('hurt')
+				} else if (e.perfect) {
+					if (e.byZombie) {
+						// 僵尸被完美格挡：60ms 内 zstun 到达 → 本次格挡耗尽僵尸体力（sword-parry）
+						if (this.pendingPerfect !== null) window.clearTimeout(this.pendingPerfect)
+						this.pendingPerfect = window.setTimeout(() => {
+							this.pendingPerfect = null
+							playSfx('perfectParry')
+							this.combatHooks?.onFlash('parry')
+						}, 60)
+					} else {
+						playSfx('perfectParry')
+						this.combatHooks?.onFlash('parry')
+					}
+				} else {
+					playSfx('unexactParry')
+				}
+				break
+			}
+			case 'zstun':
+				if (this.pendingPerfect !== null) {
+					window.clearTimeout(this.pendingPerfect)
+					this.pendingPerfect = null
+					playSfx('swordParry')
+				}
+				this.onToast?.(`僵尸眩晕！易伤 ×${e.mul.toFixed(2)} —— 1 秒内左键反击！`)
+				break
+			case 'zdie':
+				this.onToast?.('僵尸被击倒了！')
+				break
+			case 'counter_open':
+				this.onToast?.('追击窗口开启！连续左键追击！')
+				break
+			case 'roar_interrupt':
+				this.onToast?.('嘶吼被打断！')
+				break
+			case 'knockback':
+				if (e.uuid === me) {
+					this.vel.x += e.dx * e.speed
+					this.vel.z += e.dz * e.speed
+					this.combat.interruptAction()
+				}
+				break
+			case 'slow':
+				if (e.uuid === me) this.slowUntil = this.lastTime + e.dur
+				break
+			case 'guardbreak':
+				if (e.uuid === me) {
+					this.combat.applyGuardBreak(e.dur)
+					this.combatHooks?.onFlash('hurt')
+				}
+				break
+			case 'respawn':
+				if (e.uuid === me) {
+					this.camera.position.copy(WALK_SPAWN)
+					this.vel.set(0, 0, 0)
+					if (this.flying) {
+						this.flying = false
+						this.onFlyChange?.(false)
+					}
+					this.onToast?.('你被击倒了，已在出生点复活')
+				}
+				break
+		}
 	}
 
 	private handleKeyDown = (e: KeyboardEvent) => {
@@ -694,24 +823,35 @@ export class SceneManager {
 
 		if (this.mode === 'walk') {
 			this.updateWalk(dt)
-			// 格斗系统与僵尸 AI（鼠标未锁定时暂停，避免玩家挂机挨打）
+			// 格斗系统（本地剑动画 + 意图上报；伤害 / 眩晕 / 追击窗口由 PB 快照驱动）
 			const active = this.lockCtl.isLocked
-			this.combat.update(dt, time, this.camera, this.zombies, active)
-			for (const z of this.zombies) {
-				z.update(dt, time, this.camera.position, this.zombies, active)
-			}
-			for (let i = this.zombies.length - 1; i >= 0; i--) {
-				if (this.zombies[i].removeMe) {
-					this.scene.remove(this.zombies[i].group)
-					this.zombies.splice(i, 1)
-				}
+			this.combat.update(dt, time, this.camera, active)
+			// 联机输入上报（10Hz）：位置 / 朝向 / 模式 / 门状态 / 动作标签
+			if (pbClient.you && time - this.lastMpSent >= MP_INPUT_PERIOD) {
+				this.lastMpSent = time
+				this.sendMpInput()
 			}
 		} else {
 			this.orbit.update()
+		}
+
+		// 远程玩家与僵尸插值渲染（固定视角下同样可见）
+		this.remotePlayers.update(dt)
+		for (const z of this.zombies) z.update(dt, time)
+		for (let i = this.zombies.length - 1; i >= 0; i--) {
+			if (this.zombies[i].removeMe) {
+				this.scene.remove(this.zombies[i].group)
+				this.zombies.splice(i, 1)
+			}
 		}
 
 		// 设备过渡动画与逐帧效果（补间、风口摆动、紧急红闪等）
 		this.rigs.update(dt, time)
 		this.renderer.render(this.scene, this.camera)
 	}
+}
+
+/** 输入上报数值截断（3 位小数，减小包体） */
+function r3(n: number): number {
+	return Math.round(n * 1000) / 1000
 }

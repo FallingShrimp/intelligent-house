@@ -22,6 +22,8 @@ import {
   EnvelopeSchema,
   HeartbeatPayloadSchema,
   HelloPayloadSchema,
+  MpActionPayloadSchema,
+  MpInputPayloadSchema,
   PF_PAYLOAD_SCHEMAS,
   PROTOCOL_VERSION,
   SCB_PAYLOAD_SCHEMAS,
@@ -40,12 +42,15 @@ import type {
   ErrorCode,
   ErrorPayload,
   HelloPayload,
+  MpActionPayload,
+  MpInputPayload,
   Role,
   StateSnapshotPayload,
   TriggerInfo,
   UiCommandPayload,
 } from './protocol'
 import { COOLDOWN_MS, applyAction, createInitialDevices } from './devices'
+import { World } from './world'
 
 export const logger = pino({ level: process.env.LOG_LEVEL ?? 'info' })
 
@@ -56,6 +61,8 @@ const PORT = Number(process.env.PORT ?? 3000)
 const devices = new Map<string, DeviceState>(
   createInitialDevices().map((d) => [d.device_id, d]),
 )
+/** 联机对战权威世界（玩家注册 / 僵尸 AI / 伤害裁决的唯一事实源） */
+const world = new World()
 /** 设备状态广播 update_id：PB 全局单调递增 */
 let updateId = 0
 /** client_id 分配计数器 */
@@ -79,6 +86,7 @@ interface Conn {
   helloed: boolean
   outSeq: number // PB → 本连接的下行 seq，连接内单调递增
   acqConnected: boolean | null // SCB 心跳上报的 ND8 采集在线状态
+  mpUuid: string | null // 联机对战玩家 uuid（PF hello 后分配）
 }
 
 const conns = new Map<string, Conn>() // key = ws.id
@@ -152,13 +160,35 @@ function handleHello(conn: Conn, data: HelloPayload): void {
   }
   conn.helloed = true
   conn.clientId = `${conn.role}-${++clientCounter}`
+
+  // 联机对战：PF 必须给出 display_name 才算注册成功（分配 uuid + 随机颜色）
+  let you: { uuid: string; name: string; color: string } | undefined
+  if (conn.role === 'pf') {
+    if (!data.display_name) {
+      conn.helloed = false
+      sendError(conn, 'INVALID_FORMAT', 'PF 连接必须携带 display_name（玩家名）')
+      conn.ws.close()
+      return
+    }
+    const joined = world.join(conn.ws.id, data.display_name)
+    conn.mpUuid = joined.uuid
+    you = { uuid: joined.uuid, name: data.display_name, color: joined.color }
+  }
+
   sendMessage(conn, 'welcome', {
     client_id: conn.clientId,
     server_ts: Date.now(),
     snapshot: snapshotPayload(),
+    ...(you ? { you } : {}),
   })
   logger.info(
-    { client_id: conn.clientId, client_name: data.client_name, client_version: data.client_version },
+    {
+      client_id: conn.clientId,
+      client_name: data.client_name,
+      client_version: data.client_version,
+      display_name: data.display_name ?? null,
+      mp_uuid: conn.mpUuid,
+    },
     '客户端注册完成',
   )
 }
@@ -389,6 +419,24 @@ function routeMessage(conn: Conn, raw: unknown): void {
       handleUiCommand(conn, seq, p.data)
       return
     }
+    case 'mp_input': {
+      const p = MpInputPayloadSchema.safeParse(payload)
+      if (!p.success) {
+        sendError(conn, 'INVALID_FORMAT', `mp_input payload 校验失败: ${zodSummary(p.error)}`, seq)
+        return
+      }
+      if (conn.mpUuid) world.setInput(conn.mpUuid, p.data)
+      return
+    }
+    case 'mp_action': {
+      const p = MpActionPayloadSchema.safeParse(payload)
+      if (!p.success) {
+        sendError(conn, 'INVALID_FORMAT', `mp_action payload 校验失败: ${zodSummary(p.error)}`, seq)
+        return
+      }
+      if (conn.mpUuid) world.action(conn.mpUuid, p.data)
+      return
+    }
     default:
       sendError(conn, 'UNKNOWN_TYPE', `未知消息 type: ${type}`, seq)
   }
@@ -430,6 +478,7 @@ function onOpen(ws: WSLike, role: Role): void {
     helloed: false,
     outSeq: 0,
     acqConnected: null,
+    mpUuid: null,
   })
   logger.info({ endpoint: `/ws/${role}`, ws_id: ws.id }, '连接建立，等待 hello')
 }
@@ -449,10 +498,35 @@ function onMessage(ws: WSLike, message: unknown): void {
 function onClose(ws: WSLike): void {
   const conn = conns.get(ws.id)
   conns.delete(ws.id)
+  // 联机对战：断开即离开房间（世界内移除玩家）
+  if (conn) world.leave(conn.ws.id)
   logger.info({ client_id: conn?.clientId ?? null, ws_id: ws.id }, '连接关闭')
 }
 
 // ---------- 启动与优雅关闭 ----------
+
+/**
+ * 联机对战主循环：10Hz tick + world 快照 / 事件广播（仅发给已注册 PF）。
+ * 独立导出以便冒烟测试（scripts/multi_smoke.ts）在导入模式下启动。
+ */
+export function startWorldLoop(): () => void {
+  let lastTick = Date.now()
+  const MP_TICK_MS = 100
+  const mpTimer = setInterval(() => {
+    const now = Date.now()
+    const dt = Math.min(0.25, (now - lastTick) / 1000)
+    lastTick = now
+    world.tick(dt)
+    const snap = world.snapshot()
+    const events = world.drainEvents()
+    for (const conn of conns.values()) {
+      if (!conn.helloed || conn.role !== 'pf') continue
+      sendMessage(conn, 'world', snap)
+      for (const ev of events) sendMessage(conn, 'event', ev)
+    }
+  }, MP_TICK_MS)
+  return () => clearInterval(mpTimer)
+}
 
 if (import.meta.main) {
   app.listen(PORT)
@@ -461,8 +535,11 @@ if (import.meta.main) {
     'PB 仿真状态层已启动',
   )
 
+  const stopWorldLoop = startWorldLoop()
+
   const shutdown = (signal: string) => {
     logger.info({ signal }, '收到退出信号，优雅关闭中')
+    stopWorldLoop()
     for (const conn of conns.values()) {
       try {
         conn.ws.close()
