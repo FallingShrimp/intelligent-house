@@ -267,6 +267,20 @@ onBeforeUnmount(() => {
   75% { opacity: 1; transform: translateX(-50%) scale(1.7); }
   100% { opacity: 0; transform: translateX(-50%) scale(2.3); }
 }
+/* 预警配色：金=普攻 / 白=横扫（不可格挡）/ 紫=突进 */
+.attack-alert path {
+  fill: #ffd76a;
+  stroke: #b8791a;
+}
+.attack-alert.sweep path {
+  fill: #ffffff;
+  stroke: #9a9a9a;
+  filter: drop-shadow(0 0 4px rgba(255, 255, 255, 0.8));
+}
+.attack-alert.lunge path {
+  fill: #c084fc;
+  stroke: #6b21a8;
+}
 
 /* ---------------- 格挡指示 ---------------- */
 .block-meter {
