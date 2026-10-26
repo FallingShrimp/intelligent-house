@@ -220,12 +220,13 @@ export type UiCommandPayload = z.infer<typeof UiCommandPayloadSchema>
 
 // ---------- 联机对战（PB 权威世界模拟，PF 只上报输入 / 动作意图） ----------
 
-/** PF 输入状态（建议 10Hz）：位置 / 朝向 / 视角模式 / 当前动作标签 */
+/** PF 输入状态（建议 10Hz）：位置 / 朝向 / 视线（3D，剑气方向用）/ 视角模式 / 当前动作标签 */
 export const MpInputPayloadSchema = z
 	.object({
 		p: z.tuple([z.number(), z.number(), z.number()]),
 		yaw: z.number(),
 		dir: z.tuple([z.number(), z.number()]), // 相机水平前向单位向量
+		dir3: z.tuple([z.number(), z.number(), z.number()]), // 相机 3D 前向（准星方向，剑气飞行用）
 		mode: z.enum(['fp', 'free']),
 		anim: z.string().nullish(),
 	})
@@ -239,8 +240,8 @@ export const MpActionPayloadSchema = z
 		segment: z.number().int().min(0).max(2).optional(),
 		/** wave 专用：蓄力时长 s（PB 按每秒 10 体力结算消耗） */
 		hold: z.number().min(0).max(10).optional(),
-		/** pick 专用：选择的增益索引（0-6，必须是 PF 分到的 3 项之一） */
-		idx: z.number().int().min(0).max(6).optional(),
+		/** pick 专用：选择的增益索引（0-9，必须是 PF 分到的 3 项之一） */
+		idx: z.number().int().min(0).max(9).optional(),
 		/** revive 专用：要复活的玩家 uuid */
 		target: z.string().min(1).optional(),
 	})

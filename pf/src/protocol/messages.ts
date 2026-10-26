@@ -143,6 +143,8 @@ export interface MpInputPayload {
   p: [number, number, number];
   yaw: number;
   dir: [number, number];
+  /** 相机 3D 前向（准星方向，剑气飞行方向用） */
+  dir3: [number, number, number];
   mode: 'fp' | 'free';
   anim?: string | null;
 }
@@ -176,6 +178,8 @@ export interface NetPlayerState {
   kills: number;
   /** 格挡最大持续 s / 完美格挡窗口比例（窗口 = max_block × parry_pct）/ 重击蓄力时长 s */
   max_block: number; parry_pct: number; charge_dur: number;
+  /** 荆棘（受击反伤比例）/ 吸血（造成伤害回复固定值）/ 连续剑气（蓄力后追加发数） */
+  thorn_pct: number; lifesteal: number; multi_wave: number;
   /** 三选一状态（进行中非空）：抽到的 3 个增益索引 + 是否已选 */
   pick: { options: number[]; done: boolean } | null;
 }
@@ -215,8 +219,8 @@ export type MpEventPayload =
   | { kind: 'respawn'; uuid: string; pos: [number, number, number] }
   | { kind: 'counter_open' }
   | { kind: 'roar_interrupt'; id: number }
-  /** 重击剑气：by 玩家从 (x,y,z) 沿 (dx,dz) 发射（各 PF 本地渲染飞行视觉，伤害由 PB 弹道裁决） */
-  | { kind: 'wave'; by: string; x: number; y: number; z: number; dx: number; dz: number };
+  /** 重击剑气：by 玩家从 (x,y,z) 沿 3D (dx,dy,dz) 发射，绕飞行轴随机 roll 旋转（各 PF 本地渲染飞行视觉 + 与 PB 同公式定向，伤害由 PB 弹道裁决） */
+  | { kind: 'wave'; by: string; x: number; y: number; z: number; dx: number; dy: number; dz: number; roll: number };
 
 export interface HeartbeatPayload {
   acq_connected: boolean;

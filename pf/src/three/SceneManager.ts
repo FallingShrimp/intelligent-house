@@ -100,6 +100,10 @@ const CLICK_MOVE_PX = 6       // 按下-抬起位移小于该值视为点击（�
 const WATER_REFILL_S = 30     // 喝完水后自动续满间隔（秒）
 const MP_INPUT_PERIOD = 0.1   // 联机输入上报周期 s（10Hz）
 
+// 剑气面内挥摆复用对象（避免每帧分配，见 updateWaves）
+const _waveSwingQ = new THREE.Quaternion()
+const _waveZAxis = new THREE.Vector3(0, 0, 1)
+
 export class SceneManager {
 	private renderer: THREE.WebGLRenderer
 	private scene: THREE.Scene
@@ -309,7 +313,7 @@ export class SceneManager {
 		this.remotePlayers.dispose()
 		for (const w of this.wavesVis) {
 			this.scene.remove(w.mesh)
-			w.mesh.geometry.dispose()
+			w.geo.dispose() // 双平面共享同一几何体，dispose 一次
 			w.mat.dispose()
 		}
 		this.wavesVis.length = 0
@@ -551,6 +555,7 @@ export class SceneManager {
 			p: [r3(this.camera.position.x), r3(this.camera.position.y), r3(this.camera.position.z)],
 			yaw: r3(euler.y),
 			dir: [r3(dir.x / len), r3(dir.z / len)],
+			dir3: [r3(dir.x), r3(dir.y), r3(dir.z)], // 相机 3D 前向（剑气飞行方向）
 			mode: this.mode === 'walk' ? 'fp' : 'free',
 			anim: this.combat.currentAnimTag(),
 		})
@@ -560,7 +565,7 @@ export class SceneManager {
 
 	/** 剑气月牙贴图（模块级缓存） */
 	private waveTex: THREE.CanvasTexture | null = null
-	private wavesVis: { mesh: THREE.Mesh; mat: THREE.MeshBasicMaterial; x: number; z: number; dx: number; dz: number; t: number; baseRot: number }[] = []
+	private wavesVis: { mesh: THREE.Group; geo: THREE.PlaneGeometry; mat: THREE.MeshBasicMaterial; pos: THREE.Vector3; dir: THREE.Vector3; t: number; quat: THREE.Quaternion }[] = []
 
 	private getWaveTex(): THREE.CanvasTexture {
 		if (this.waveTex) return this.waveTex
@@ -588,20 +593,34 @@ export class SceneManager {
 		return tex
 	}
 
-	/** 生成剑气实体（wave 事件到达时调用，含发射者自己） */
-	private spawnWave(x: number, y: number, z: number, dx: number, dz: number) {
+	/** 生成剑气实体（wave 事件到达时调用，含发射者自己）：3D 飞行 + 绕飞行轴 roll 旋转 */
+	private spawnWave(x: number, y: number, z: number, dx: number, dy: number, dz: number, roll: number) {
 		playSfx('roar') // 剑气破空声（各端本地播放，含发射者）
 		const mat = new THREE.MeshBasicMaterial({
 			map: this.getWaveTex(), transparent: true, opacity: 0.95,
 			blending: THREE.AdditiveBlending, depthWrite: false, side: THREE.DoubleSide,
 		})
-		const mesh = new THREE.Mesh(new THREE.PlaneGeometry(2.8, 1.4), mat)
-		mesh.position.set(x, y, z)
-		// 水平躺放（绕 X -90°），再在水平面内把贴图凸缘（几何 +V）对齐飞行方向
-		const baseRot = Math.atan2(-dx, -dz)
-		mesh.rotation.set(-Math.PI / 2, 0, baseRot)
-		this.scene.add(mesh)
-		this.wavesVis.push({ mesh, mat, x, z, dx, dz, t: 0, baseRot })
+		// 双平面十字交叉（共享几何体/材质）：单平面侧视为 0 厚度看不清，
+		// 交叉后任意视角均有投影宽度，重叠处 additive 叠亮更醒目
+		const geo = new THREE.PlaneGeometry(2.8, 1.4)
+		const group = new THREE.Group()
+		group.add(new THREE.Mesh(geo, mat))
+		const cross = new THREE.Mesh(geo, mat)
+		cross.rotation.y = Math.PI / 2 // 绕飞行轴（局部 +Y）转 90° 与主面交叉
+		group.add(cross)
+		group.position.set(x, y, z)
+		// 基向量与 PB waveBasis 同公式：u=飞行方向（贴图 +V 凸缘），c=面内横轴（随 roll 旋转），n=面法线
+		const u = new THREE.Vector3(dx, dy, dz).normalize()
+		const c0 = new THREE.Vector3(-u.z, 0, u.x)
+		if (c0.lengthSq() < 1e-4) c0.set(1, 0, 0)
+		c0.normalize()
+		const n0 = new THREE.Vector3().crossVectors(u, c0).normalize()
+		const c = c0.multiplyScalar(Math.cos(roll)).addScaledVector(n0, Math.sin(roll)).normalize()
+		// 贴图平面局部 +Y → 飞行方向、+X → 面内横轴、+Z → 面法线（makeBasis 右手系）
+		const zAxis = new THREE.Vector3().crossVectors(c, u)
+		const quat = new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(c, u.clone(), zAxis))
+		this.scene.add(group)
+		this.wavesVis.push({ mesh: group, geo, mat, pos: new THREE.Vector3(x, y, z), dir: u, t: 0, quat })
 	}
 
 	private updateWaves(dt: number) {
@@ -610,15 +629,15 @@ export class SceneManager {
 			w.t += dt
 			if (w.t >= 1.2) {
 				this.scene.remove(w.mesh)
-				w.mesh.geometry.dispose()
+				w.geo.dispose() // 双平面共享同一几何体，dispose 一次
 				w.mat.dispose()
 				this.wavesVis.splice(i, 1)
 				continue
 			}
-			w.x += w.dx * 12 * dt
-			w.z += w.dz * 12 * dt
-			w.mesh.position.set(w.x, 1.3 + Math.sin(w.t * 6) * 0.05, w.z)
-			w.mesh.rotation.z = w.baseRot + Math.sin(w.t * 14) * 0.12 // 挥摆
+			w.pos.addScaledVector(w.dir, 12 * dt)
+			w.mesh.position.copy(w.pos)
+			// 面内挥摆（绕面法线，即局部 Z）
+			w.mesh.quaternion.copy(w.quat).multiply(_waveSwingQ.setFromAxisAngle(_waveZAxis, Math.sin(w.t * 14) * 0.12))
 			w.mat.opacity = Math.max(0, 0.95 * (1 - (w.t / 1.2) ** 3))
 		}
 	}
@@ -725,7 +744,7 @@ export class SceneManager {
 			}
 			case 'wave': {
 				// 重击剑气：各端本地渲染飞行视觉（伤害由 PB 弹道裁决）
-				this.spawnWave(e.x, e.y, e.z, e.dx, e.dz)
+				this.spawnWave(e.x, e.y, e.z, e.dx, e.dy, e.dz, e.roll)
 				break
 			}
 			case 'parry': {

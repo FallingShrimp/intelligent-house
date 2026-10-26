@@ -68,9 +68,34 @@ const WAVE_SPEED = 12     // m/s
 const WAVE_TTL_S = 1.2    // 飞行寿命（约 14m 射程）
 const WAVE_RADIUS = 0.9   // 命中判定半径
 
+// 僵尸碰撞圆柱（包裹全部模型：模型横向半宽 ~0.45 / 头顶 ~1.87，含动态手臂余量取 R0.55）
+const Z_HIT_R = 0.55
+const Z_HIT_H = 1.9
+/** 圆柱碰撞采样点（相对僵尸脚下中心，y 为绝对高度）：3 层 ×（圆心 + 四向边缘），任一点命中即判中 */
+const Z_HIT_SAMPLES: [number, number, number][] = []
+for (const sy of [0.15, Z_HIT_H / 2, Z_HIT_H - 0.15]) {
+	Z_HIT_SAMPLES.push(
+		[0, sy, 0], [Z_HIT_R, sy, 0], [-Z_HIT_R, sy, 0], [0, sy, Z_HIT_R], [0, sy, -Z_HIT_R],
+	)
+}
+
 export type ZState =
 	| 'enter' | 'chase' | 'windup' | 'recover' | 'stunned' | 'dead'
 	| 'sweep' | 'lungeWind' | 'lungeDash' | 'roar'
+
+/** 飞行中的重击剑气（PB 权威弹道） */
+interface Wave {
+	owner: string
+	x: number; y: number; z: number
+	/** 飞行方向（3D 单位向量 = 发射时摄像机准星朝向） */
+	dx: number; dy: number; dz: number
+	/** 剑气面基：c = 面内横轴，n = 面法线（随机 roll 绕飞行轴旋转，碰撞箱跟随） */
+	cx: number; cy: number; cz: number
+	nx: number; ny: number; nz: number
+	t: number
+	reg: number
+	hits: string[]
+}
 
 export interface MpPlayer {
 	uuid: string
@@ -80,11 +105,15 @@ export interface MpPlayer {
 	x: number; y: number; z: number
 	yaw: number
 	dirX: number; dirZ: number
+	/** 摄像机 3D 前向（mp_input dir3，剑气飞行方向） */
+	lookX: number; lookY: number; lookZ: number
 	mode: 'fp' | 'free'
 	anim: string | null
 	hp: number
 	stamina: number
 	stunUntil: number
+	/** 体力耗尽眩晕截止（tick 中到期 → 体力回满） */
+	exhaustUntil: number
 	guardBreakUntil: number
 	blocking: boolean
 	blockStart: number
@@ -101,6 +130,12 @@ export interface MpPlayer {
 	blockMaxS: number    // 格挡最大持续（初始 1.0s）
 	dmgMul: number       // 全局伤害倍率（初始 1）
 	chargeSpd: number    // 重击蓄力速度倍率（蓄力时长 = 1 / chargeSpd，初始 1）
+	thorn: number        // 荆棘：受击时反弹伤害 × 该比例（初始 0）
+	lifesteal: number    // 吸血：造成伤害回复固定血量（初始 0）
+	multiWave: number    // 连续剑气：蓄力发射后追加的剑气发数（初始 0）
+	/** 连发剑气队列：剩余发数 + 下一发时刻（间隔 0.1s） */
+	waveQueue: number
+	waveNextAt: number
 	/** 三选一选择状态（进行中时非空）：随机 3 个选项索引 + 已选 */
 	pick: { options: number[]; choice: number | null } | null
 	/** 下落攻击判定：由 10Hz 位置差分推导的垂直速度 m/s */
@@ -150,7 +185,7 @@ export type MpEvent =
 	| { kind: 'respawn'; uuid: string; pos: [number, number, number] }
 	| { kind: 'counter_open' }
 	| { kind: 'roar_interrupt'; id: number }
-	| { kind: 'wave'; by: string; x: number; y: number; z: number; dx: number; dz: number }
+	| { kind: 'wave'; by: string; x: number; y: number; z: number; dx: number; dy: number; dz: number; roll: number }
 
 export interface WorldSnapshot {
 	t: number
@@ -167,6 +202,7 @@ export interface WorldSnapshot {
 		anim: string | null
 		kills: number
 		max_block: number; parry_pct: number; charge_dur: number
+		thorn_pct: number; lifesteal: number; multi_wave: number
 		pick: { options: number[]; done: boolean } | null
 	}[]
 	zombies: {
@@ -182,8 +218,8 @@ export interface WorldSnapshot {
 export class World {
 	players = new Map<string, MpPlayer>()   // key = uuid
 	zombies: MpZombie[] = []
-	/** 飞行中的重击剑气（PB 权威弹道，命中裁决 30 伤害） */
-	waves: { owner: string; x: number; y: number; z: number; dx: number; dz: number; t: number; reg: number; hits: string[] }[] = []
+	/** 飞行中的重击剑气（PB 权威弹道，扇形碰撞箱随随机 roll 旋转） */
+	waves: Wave[] = []
 	chaseLeft = 0
 	chaseUntil = 0
 	private events: MpEvent[] = []
@@ -201,14 +237,17 @@ export class World {
 			uuid, name, color, wsId,
 			x: -1.6, y: 1.6, z: 2.4,
 			yaw: 0, dirX: 0, dirZ: -1,
+			lookX: 0, lookY: 0, lookZ: -1,
 			mode: 'free', anim: null,
 			hp: P_MAX_HP, stamina: P_MAX_ST,
-			stunUntil: 0, guardBreakUntil: 0,
+			stunUntil: 0, exhaustUntil: 0, guardBreakUntil: 0,
 			blocking: false, blockStart: 0, blockCdUntil: 0,
 			lastStaminaUse: -10, lastAttack: 0, combo: -1,
 			kills: 0,
 			atk: 10, maxHp: P_MAX_HP, parryPct: 0.5, maxSt: P_MAX_ST,
 			blockMaxS: 1.0, dmgMul: 1, chargeSpd: 1,
+			thorn: 0, lifesteal: 0, multiWave: 0,
+			waveQueue: 0, waveNextAt: 0,
 			pick: null,
 			vy: 0, lastY: 1.6, lastInputAt: 0,
 			blockTimes: [],
@@ -231,6 +270,7 @@ export class World {
 
 	setInput(uuid: string, d: {
 		p: [number, number, number]; yaw: number; dir: [number, number]
+		dir3: [number, number, number]
 		mode: 'fp' | 'free'; anim?: string | null
 	}): void {
 		const p = this.players.get(uuid)
@@ -250,6 +290,13 @@ export class World {
 		p.dirX = d.dir[0]; p.dirZ = d.dir[1]
 		p.mode = d.mode
 		p.anim = d.anim ?? null
+		// 摄像机 3D 前向（剑气飞行方向）：合法向量才更新
+		const ll = Math.hypot(d.dir3[0], d.dir3[1], d.dir3[2])
+		if (ll >= 0.01) {
+			p.lookX = d.dir3[0] / ll
+			p.lookY = d.dir3[1] / ll
+			p.lookZ = d.dir3[2] / ll
+		}
 	}
 
 	action(uuid: string, d: { kind: 'attack' | 'parry_start' | 'parry_stop' | 'respawn' | 'wave' | 'pick' | 'revive' | 'lamp'; segment?: number; hold?: number; idx?: number; target?: string }): void {
@@ -296,33 +343,51 @@ export class World {
 		return z > 3.0 ? 2 : 1
 	}
 
+	/** 剑气飞行方向：摄像机准星 3D 前向；无输入时退化为水平朝向 */
+	private waveDir(p: MpPlayer): [number, number, number] {
+		const len = Math.hypot(p.lookX, p.lookY, p.lookZ)
+		if (len >= 0.01) return [p.lookX / len, p.lookY / len, p.lookZ / len]
+		const hl = Math.hypot(p.dirX, p.dirZ)
+		if (hl >= 0.01) return [p.dirX / hl, 0, p.dirZ / hl]
+		return [Math.sin(p.yaw), 0, -Math.cos(p.yaw)]
+	}
+
 	private fireWave(p: MpPlayer, now: number, hold?: number): void {
 		if (p.stunUntil > now || now < p.guardBreakUntil) return
-		// 方向取最近上报的视线前向；无输入时退化为 yaw 推导
-		let dx = p.dirX
-		let dz = p.dirZ
-		const len = Math.hypot(dx, dz)
-		if (len < 0.01) {
-			dx = Math.sin(p.yaw)
-			dz = -Math.cos(p.yaw)
-		} else {
-			dx /= len
-			dz /= len
-		}
-		const x = p.x + dx * 0.5
-		const z = p.z + dz * 0.5
-		this.waves.push({ owner: p.uuid, x, y: 1.3, z, dx, dz, t: 0, reg: this.region(x, z), hits: [] })
-		this.events.push({ kind: 'wave', by: p.uuid, x, y: 1.3, z, dx, dz })
+		this.emitWave(p, now)
 		// 蓄力消耗：每秒 10 体力（发射时一次结算，随 hold 上限保护）
 		this.useStamina(p, 10 * Math.min(5, hold ?? 1), now)
+		// 连续剑气：蓄力发射后每 0.1s 追发一发（眩晕 / 死亡时由 tick 中止）
+		if (p.multiWave > 0 && p.stunUntil <= now) {
+			p.waveQueue = p.multiWave
+			p.waveNextAt = now + 0.1
+		}
+	}
+
+	/** 发射一发剑气：方向取当前准星 3D 朝向，绕飞行轴随机 roll 旋转碰撞箱与视觉 */
+	private emitWave(p: MpPlayer, now: number): void {
+		const [dx, dy, dz] = this.waveDir(p)
+		const roll = Math.random() * Math.PI * 2
+		const { c, n } = waveBasis(dx, dy, dz, roll)
+		const x = p.x + dx * 0.5
+		const y = p.y + dy * 0.5
+		const z = p.z + dz * 0.5
+		this.waves.push({
+			owner: p.uuid, x, y, z, dx, dy, dz,
+			cx: c[0], cy: c[1], cz: c[2], nx: n[0], ny: n[1], nz: n[2],
+			t: 0, reg: this.region(x, z), hits: [],
+		})
+		this.events.push({ kind: 'wave', by: p.uuid, x, y, z, dx, dy, dz, roll })
 	}
 
 	private tickWaves(dt: number, now: number): void {
 		for (let i = this.waves.length - 1; i >= 0; i--) {
 			const w = this.waves[i]
 			w.t += dt
-			w.x += w.dx * WAVE_SPEED * dt
-			w.z += w.dz * WAVE_SPEED * dt
+			const step = WAVE_SPEED * dt
+			w.x += w.dx * step
+			w.y += w.dy * step
+			w.z += w.dz * step
 			const reg = this.region(w.x, w.z)
 			// 撞墙：跨入/跨出门廊（四面墙）；室内 ↔ 坝坝开放连通不拦
 			if (reg !== w.reg) {
@@ -332,30 +397,34 @@ export class World {
 				}
 				w.reg = reg
 			}
+			// 撞地 / 天花板（室内 2.8m、门廊 2.45m；室外无顶）
+			if (w.y <= 0.06 || (reg === 1 && w.y >= 2.72) || (reg === 0 && w.y >= 2.4)) {
+				this.waves.splice(i, 1)
+				continue
+			}
 			const by = this.players.get(w.owner)
 			if (!by) {
 				this.waves.splice(i, 1)
 				continue
 			}
-			// 命中：半径内所有未命中过的存活目标（僵尸优先，无限穿透，同一目标只结算一次）
-			const candidates: { key: string; z: MpZombie | null; p: MpPlayer | null; d: number }[] = []
+			// 命中：扇形碰撞箱（随 roll 旋转）内所有未命中过的存活目标（无限穿透，同一目标只结算一次）
+			const targets: { key: string; z: MpZombie | null; p: MpPlayer | null; hit: boolean }[] = []
 			for (const z of this.zombies) {
 				if (z.state === 'dead') continue
 				const key = `z${z.id}`
 				if (w.hits.includes(key)) continue
-				candidates.push({ key, z, p: null, d: Math.hypot(z.x - w.x, z.z - w.z) })
+				targets.push({ key, z, p: null, hit: zombieWaveHit(w, z.x, z.z) })
 			}
 			for (const o of this.players.values()) {
 				if (o.uuid === w.owner || o.mode !== 'fp' || o.hp <= 0) continue
 				if (w.hits.includes(o.uuid)) continue
-				candidates.push({ key: o.uuid, z: null, p: o, d: Math.hypot(o.x - w.x, o.z - w.z) })
+				targets.push({ key: o.uuid, z: null, p: o, hit: waveHit(w, o.x, 1.0, o.z) })
 			}
-			candidates.sort((a, b) => a.d - b.d)
-			for (const c of candidates) {
-				if (c.d >= WAVE_RADIUS) break
-				w.hits.push(c.key)
-				if (c.z) this.damageZombie(c.z, WAVE_DMG * by.atk / 10 * by.dmgMul, by, now)
-				else if (c.p) this.damagePlayer(c.p, WAVE_DMG * by.atk / 10 * by.dmgMul, by, now, false, true)
+			for (const t of targets) {
+				if (!t.hit) continue
+				w.hits.push(t.key)
+				if (t.z) this.damageZombie(t.z, WAVE_DMG * by.atk / 10 * by.dmgMul, by, now)
+				else if (t.p) this.damagePlayer(t.p, WAVE_DMG * by.atk / 10 * by.dmgMul, by, now, false, true)
 			}
 			if (w.t > WAVE_TTL_S) this.waves.splice(i, 1)
 		}
@@ -454,6 +523,8 @@ export class World {
 		z.x += (dx / d) * 0.12
 		z.z += (dz / d) * 0.12
 		this.events.push({ kind: 'dmg_z', id: z.id, amount: dmg, crit: amount >= 12, by: by.uuid })
+		// 吸血：造成伤害回复固定血量
+		if (by.lifesteal > 0 && by.hp > 0) by.hp = Math.min(by.maxHp, by.hp + by.lifesteal)
 		if (z.hp <= 0) {
 			z.state = 'dead'
 			z.deadAt = this.now()
@@ -469,13 +540,14 @@ export class World {
 	static readonly PICK_OPTIONS = [
 		'攻击力 +5', '血量上限 +20', '完美格挡窗口 +2%',
 		'体力上限 +10', '格挡最大持续 +0.25s', '所有伤害 +10%', '重击蓄力速度 +15%',
+		'荆棘 +15%', '吸血 +2', '连续剑气 +1',
 	]
 
 	/** 僵尸被击败：房间内所有第一人称玩家进入三选一（每人独立随机抽 3 项） */
 	private startPickPhase(): void {
 		const inRoom = [...this.players.values()].filter((q) => q.mode === 'fp')
 		if (!inRoom.length) return
-		const pool = [0, 1, 2, 3, 4, 5, 6]
+		const pool = World.PICK_OPTIONS.map((_, i) => i)
 		for (const p of inRoom) {
 			const shuffled = [...pool].sort(() => Math.random() - 0.5)
 			p.pick = { options: shuffled.slice(0, 3), choice: null }
@@ -511,6 +583,9 @@ export class World {
 				case 4: p.blockMaxS += 0.25; break
 				case 5: p.dmgMul = Math.round((p.dmgMul + 0.1) * 100) / 100; break
 				case 6: p.chargeSpd = Math.round((p.chargeSpd + 0.15) * 100) / 100; break
+				case 7: p.thorn = Math.round((p.thorn + 0.15) * 100) / 100; break
+				case 8: p.lifesteal += 2; break
+				case 9: p.multiWave += 1; break
 			}
 			p.pick = null
 		}
@@ -548,6 +623,7 @@ export class World {
 		const now = this.now()
 		t.hp = t.maxHp
 		t.stamina = t.maxSt
+		t.exhaustUntil = 0
 		t.blocking = false
 		t.blockStart = 0
 		t.combo = -1
@@ -598,7 +674,7 @@ export class World {
 	private damagePlayerByZombie(z: MpZombie, v: MpPlayer, amount: number, now: number): void {
 		if (v.hp <= 0) return
 		if (v.stunUntil > now) {
-			this.hurtPlayer(v, amount, now, false, null)
+			this.hurtPlayer(v, amount, now, false, null, z)
 			return
 		}
 		if (v.blocking) {
@@ -614,7 +690,7 @@ export class World {
 			}
 			if (Math.random() < 0.25) {
 				this.events.push({ kind: 'parry', uuid: v.uuid, perfect: false, fail: true, drain: 0, byZombie: true })
-				this.hurtPlayer(v, amount, now, false, null)
+				this.hurtPlayer(v, amount, now, false, null, z)
 				return
 			}
 			this.useStamina(v, 10, now)
@@ -625,14 +701,41 @@ export class World {
 		this.hurtPlayer(v, amount, now, false, null)
 	}
 
-	private hurtPlayer(v: MpPlayer, amount: number, now: number, _interrupt: boolean, _by: MpPlayer | null): void {
+	/** 玩家掉血落地结算：荆棘反伤 / 吸血回复 / 死亡清理 */
+	private hurtPlayer(v: MpPlayer, amount: number, now: number, _interrupt: boolean, byPlayer: MpPlayer | null, byZombie: MpZombie | null = null): void {
 		v.hp = Math.max(0, v.hp - amount)
-		this.events.push({ kind: 'dmg_p', uuid: v.uuid, amount, by: _by?.uuid ?? '', interrupt: false })
+		this.events.push({ kind: 'dmg_p', uuid: v.uuid, amount, by: byPlayer?.uuid ?? '', interrupt: false })
+		// 荆棘：伤害发出者受到「伤害 × 荆棘」等量反伤（直伤，不触发对方格挡 / 再反伤）
+		const refl = Math.round(amount * v.thorn)
+		if (refl > 0) {
+			if (byZombie) this.damageZombie(byZombie, refl, v, now)
+			else if (byPlayer) this.reflectDamage(byPlayer, refl, v.uuid)
+		}
+		// 吸血：伤害发出者（玩家）回复固定血量
+		if (byPlayer && byPlayer.lifesteal > 0 && byPlayer.hp > 0) {
+			byPlayer.hp = Math.min(byPlayer.maxHp, byPlayer.hp + byPlayer.lifesteal)
+		}
 		if (v.hp <= 0) {
 			// 死亡：保持死亡状态等待玩家手动复活（PF 死亡覆盖层 → mp_action respawn）
 			v.stunUntil = 0
+			v.exhaustUntil = 0
+			v.waveQueue = 0
 			v.blocking = false
 			v.blockStart = 0
+		}
+	}
+
+	/** 荆棘反伤直伤：不触发格挡 / 荆棘 / 吸血（避免递归） */
+	private reflectDamage(t: MpPlayer, amount: number, sourceUuid: string): void {
+		if (t.hp <= 0) return
+		t.hp = Math.max(0, t.hp - amount)
+		this.events.push({ kind: 'dmg_p', uuid: t.uuid, amount, by: sourceUuid, interrupt: false })
+		if (t.hp <= 0) {
+			t.stunUntil = 0
+			t.exhaustUntil = 0
+			t.waveQueue = 0
+			t.blocking = false
+			t.blockStart = 0
 		}
 	}
 
@@ -646,6 +749,7 @@ export class World {
 		p.hp = p.maxHp
 		p.stamina = p.maxSt
 		p.stunUntil = now + 1.2
+		p.exhaustUntil = 0
 		p.blocking = false
 		p.blockStart = 0
 		p.combo = -1
@@ -658,6 +762,7 @@ export class World {
 		p.lastStaminaUse = now
 		if (p.stamina <= 0) {
 			p.stunUntil = now + P_STUN_S
+			p.exhaustUntil = p.stunUntil // 体力耗尽眩晕：结束后体力回满（tick 结算）
 			p.blocking = false
 		}
 	}
@@ -976,8 +1081,23 @@ export class World {
 		if (this.pickPhase) return
 		// 空场清理：房间内没有第一人称玩家时清除所有僵尸
 		this.clearZombiesIfEmpty()
-		// 玩家体力回复
+		// 玩家：体力耗尽眩晕结束回满 / 连发剑气队列 / 体力回复
 		for (const p of this.players.values()) {
+			// 体力耗尽眩晕到期 → 体力恢复到 100%
+			if (p.exhaustUntil > 0 && now >= p.exhaustUntil) {
+				p.exhaustUntil = 0
+				if (p.hp > 0) p.stamina = p.maxSt
+			}
+			// 连续剑气：每 0.1s 追发一发（眩晕 / 死亡中止）
+			if (p.waveQueue > 0 && now >= p.waveNextAt) {
+				if (p.hp <= 0 || p.stunUntil > now) {
+					p.waveQueue = 0
+				} else {
+					this.emitWave(p, now)
+					p.waveQueue--
+					p.waveNextAt = now + 0.1
+				}
+			}
 			if (
 				!p.blocking && p.stamina < p.maxSt &&
 				p.stunUntil < now && now - p.lastStaminaUse > P_REGEN_DELAY
@@ -1019,6 +1139,7 @@ export class World {
 				anim: p.anim,
 				kills: p.kills,
 				max_block: p.blockMaxS, parry_pct: p.parryPct, charge_dur: round2(1 / p.chargeSpd),
+				thorn_pct: p.thorn, lifesteal: p.lifesteal, multi_wave: p.multiWave,
 				pick: p.pick ? { options: p.pick.options, done: p.pick.choice !== null } : null,
 			})),
 			zombies: this.zombies.map((z) => ({
@@ -1048,6 +1169,74 @@ export class World {
 
 function round2(n: number): number {
 	return Math.round(n * 100) / 100
+}
+
+/**
+ * 剑气面基：u = 飞行方向，c = 面内横轴，n = 面法线。
+ * roll 绕飞行轴 u 旋转剑气面（碰撞箱与 PF 视觉共用同一公式，保证一致）。
+ * 参考横轴 = cross(u, 世界上方向)，u 近垂直时退化为世界 X。
+ */
+function waveBasis(ux: number, uy: number, uz: number, roll: number): {
+	c: [number, number, number]
+	n: [number, number, number]
+} {
+	let c0x = -uz
+	let c0y = 0
+	let c0z = ux
+	if (Math.hypot(c0x, c0z) < 0.01) {
+		c0x = 1; c0y = 0; c0z = 0
+	} else {
+		const l = Math.hypot(c0x, c0z)
+		c0x /= l; c0z /= l
+	}
+	// n0 = u × c0
+	const n0x = uy * c0z - uz * c0y
+	const n0y = uz * c0x - ux * c0z
+	const n0z = ux * c0y - uy * c0x
+	const cos = Math.cos(roll)
+	const sin = Math.sin(roll)
+	// c = c0·cos + n0·sin；n = u × c
+	const cx = c0x * cos + n0x * sin
+	const cy = c0y * cos + n0y * sin
+	const cz = c0z * cos + n0z * sin
+	const nx = uy * cz - uz * cy
+	const ny = uz * cx - ux * cz
+	const nz = ux * cy - uy * cx
+	return { c: [cx, cy, cz], n: [nx, ny, nz] }
+}
+
+/**
+ * 剑气扇形命中测试（跟随 roll 旋转）：剑气面内以飞行方向为轴 ±66°、
+ * 半径 WAVE_RADIUS 的实心扇区，面外 ±0.45 厚度（目标点：玩家 1.0 高）。
+ */
+function waveHit(w: Wave, tx: number, ty: number, tz: number): boolean {
+	const vx = tx - w.x
+	const vy = ty - w.y
+	const vz = tz - w.z
+	const a = vx * w.dx + vy * w.dy + vz * w.dz // 沿飞行轴分量
+	if (a < -0.3) return false // 已掠过
+	// 垂直于飞行轴的分量 → 面外 / 面内横轴投影
+	const rx = vx - a * w.dx
+	const ry = vy - a * w.dy
+	const rz = vz - a * w.dz
+	const h = rx * w.nx + ry * w.ny + rz * w.nz
+	if (Math.abs(h) > 0.45) return false
+	const c = rx * w.cx + ry * w.cy + rz * w.cz
+	if (Math.hypot(a, c) > WAVE_RADIUS) return false
+	return Math.abs(Math.atan2(c, a)) <= 1.15
+}
+
+/**
+ * 僵尸圆柱碰撞箱命中：碰撞箱 = 包裹全部僵尸模型的圆柱（R=Z_HIT_R、高=Z_HIT_H），
+ * 用 3 层 × 5 点采样近似（任一点落入剑气扇形体即命中）。避免单点判定漏判——
+ * roll 随机旋转后剑面可能近乎水平/竖直，僵尸中心单点易落在面外厚度或扇区外，
+ * 表现为「视觉上月牙盖住僵尸却判未中」。
+ */
+function zombieWaveHit(w: Wave, zx: number, zz: number): boolean {
+	for (const [ox, oy, oz] of Z_HIT_SAMPLES) {
+		if (waveHit(w, zx + ox, oy, zz + oz)) return true
+	}
+	return false
 }
 
 function hslHue(color: string): number | null {

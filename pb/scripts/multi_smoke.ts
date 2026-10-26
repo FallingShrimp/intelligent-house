@@ -128,7 +128,7 @@ function nextSeq(): number {
 
 /** 上报 10Hz 输入（位置 / 朝向 / 模式） */
 function input(conn: TestConn, p: [number, number, number], dir: [number, number], mode: 'fp' | 'free'): void {
-  send(conn, 'mp_input', nextSeq(), { p, yaw: 0, dir, mode, anim: null })
+  send(conn, 'mp_input', nextSeq(), { p, yaw: 0, dir, dir3: [dir[0], 0, dir[1]], mode, anim: null })
 }
 
 /** 轮询等待快照条件成立（10Hz world 消息） */
