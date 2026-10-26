@@ -17,11 +17,16 @@ import { playSfx } from './audio'
 import { buildSword } from './sword'
 import type { NetZombie } from './zombie'
 
+/** 飘字类型（对应 PB DamageSign） */
+export type FloatKind = 'normal' | 'crit' | 'heal' | 'blocked'
+
 export interface CombatHooks {
 	onHud(): void
 	onToast(text: string): void
-	onFloat(text: string, sxPct: number, syPct: number, crit: boolean): void
+	onFloat(text: string, sxPct: number, syPct: number, kind: FloatKind): void
 	onFlash(kind: 'hurt' | 'parry'): void
+	/** 空中戳刺：镜头 slerp 转向目标（dir = 指向目标的单位向量） */
+	onStabAim(dir: THREE.Vector3): void
 }
 
 export interface RemoteCenter {
@@ -130,7 +135,7 @@ interface Ghost {
 interface FloatReq {
 	pos: THREE.Vector3
 	text: string
-	crit: boolean
+	kind: FloatKind
 }
 
 export class PlayerCombat {
@@ -161,6 +166,7 @@ export class PlayerCombat {
 	private sword: THREE.Group | null = null
 	private chargeStart = -1   // >=0 表示蓄力重击中（按住左键）
 	private chargeNotified = false // 蓄满提示音已播
+	private stabPitch: number | null = null // 空中戳刺俯仰（anim 上报 stab|<pitch>）
 	private disposed = false
 	private floats: FloatReq[] = []
 
@@ -225,6 +231,7 @@ export class PlayerCombat {
 		if (this.cur) {
 			this.cur = null
 			this.buffered = null
+			this.stabPitch = null
 		}
 		if (this.blocking) {
 			this.blocking = false
@@ -234,17 +241,17 @@ export class PlayerCombat {
 	}
 
 	/** 世界坐标飘字请求（dmg_z / dmg_p 事件），update 中投影到屏幕 */
-	pushFloat(pos: THREE.Vector3, text: string, crit: boolean) {
-		this.floats.push({ pos: pos.clone(), text, crit })
+	pushFloat(pos: THREE.Vector3, text: string, kind: FloatKind = 'normal') {
+		this.floats.push({ pos: pos.clone(), text, kind })
 	}
 
 	// ---------------- 输入（本地动画 + 意图上报） ----------------
 
 	/**
-	 * 左键：眩晕 / 破防中吞掉点击；反击 / 追击 / 三段连击按本地可见状态
+	 * 左键：眩晕 / 破防中吞掉点击；反击 / 追击 / 空中戳刺 / 三段连击按本地可见状态
 	 * 选择动画并上报 attack 意图（伤害由 PB 裁决）。无目标返回 false 交给场景交互。
 	 */
-	onLeftClick(now: number, zombies: NetZombie[], remotes: RemoteCenter[], camera: THREE.PerspectiveCamera): boolean {
+	onLeftClick(now: number, zombies: NetZombie[], remotes: RemoteCenter[], camera: THREE.PerspectiveCamera, onGround: boolean): boolean {
 		if (this.hp <= 0) return true // 死亡：吞掉点击（复活经死亡覆盖层按钮）
 		if (this.stunUntilLocal > now) return true
 		if (now < this.guardBreakUntil) return true
@@ -268,6 +275,19 @@ export class PlayerCombat {
 			return true
 		}
 
+		// 空中戳刺：滞空左键 → 3.4m 内最近目标，复用戳刺动画 + 镜头转向目标
+		if (!onGround && !this.cur) {
+			const stab = this.findStabTarget(zombies, remotes, camera)
+			if (stab) {
+				this.startSwing(SWING_THRUST, now)
+				pbClient.sendMpAction({ kind: 'attack', segment: 0 })
+				this.stabPitch = Math.asin(THREE.MathUtils.clamp(stab.dir.y, -1, 1))
+				this.hooks.onStabAim(stab.dir)
+				return true
+			}
+			// 无目标：落到下方普通挥砍逻辑
+		}
+
 		const hasTarget = this.findTarget(zombies, remotes, camera) !== null
 		if (!hasTarget && !this.cur) return false // 无目标 → 场景交互
 
@@ -279,6 +299,22 @@ export class PlayerCombat {
 		this.startSwing(COMBO[this.combo], now)
 		pbClient.sendMpAction({ kind: 'attack', segment: this.combo })
 		return true
+	}
+
+	/** 空中戳刺目标：僵尸 + 远程玩家中心，取最近且 ≤3.4m（返回指向目标的单位向量） */
+	private findStabTarget(zombies: NetZombie[], remotes: RemoteCenter[], camera: THREE.PerspectiveCamera): { dir: THREE.Vector3 } | null {
+		let best: THREE.Vector3 | null = null
+		let bd = COUNTER_REACH
+		for (const z of zombies) {
+			if (z.dead) continue
+			const d = this.tmpD.copy(z.centerPos).sub(camera.position)
+			if (d.length() < bd) { bd = d.length(); best = d.clone() }
+		}
+		for (const r of remotes) {
+			const d = this.tmpD.set(r.x, r.y, r.z).sub(camera.position)
+			if (d.length() < bd) { bd = d.length(); best = d.clone() }
+		}
+		return best ? { dir: best.normalize() } : null
 	}
 
 	/** 无交互目标时的空挥（保持手感，同样上报意图） */
@@ -308,9 +344,9 @@ export class PlayerCombat {
 		this.emitHud(true)
 	}
 
-	/** 当前动作标签（mp_input.anim，供远程玩家渲染简单动作） */
+	/** 当前动作标签（mp_input.anim，供远程玩家渲染简单动作；空中戳刺带俯仰 stab|<pitch>） */
 	currentAnimTag(): string | null {
-		if (this.cur) return this.cur.tag
+		if (this.cur) return this.stabPitch !== null ? `stab|${this.stabPitch.toFixed(2)}` : this.cur.tag
 		if (this.chargeStart >= 0) return 'charge'
 		if (this.blocking) return 'block'
 		return null
@@ -351,7 +387,7 @@ export class PlayerCombat {
 		this.chargeStart = -1
 		this.combo = -1 // 剑气不算三段连击
 		this.startSwing(SWING_CHASE, now)
-		pbClient.sendMpAction({ kind: 'wave', hold: Math.min(5, Math.round(hold * 10) / 10) })
+		pbClient.sendMpAction({ kind: 'wave', hold: Math.round(hold * 10) / 10 })
 		return true
 	}
 
@@ -377,6 +413,7 @@ export class PlayerCombat {
 			this.curT += dt
 			if (this.curT >= this.cur.dur) {
 				this.cur = null
+				this.stabPitch = null
 				if (this.buffered !== null) {
 					this.combo = this.buffered
 					this.buffered = null
@@ -392,7 +429,7 @@ export class PlayerCombat {
 			if (p.z > 1) continue
 			const sx = (p.x * 0.5 + 0.5) * 100
 			const sy = (-p.y * 0.5 + 0.5) * 100
-			this.hooks.onFloat(f.text, sx, sy, f.crit)
+			this.hooks.onFloat(f.text, sx, sy, f.kind)
 		}
 		this.floats.length = 0
 

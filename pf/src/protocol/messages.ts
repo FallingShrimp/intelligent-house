@@ -180,6 +180,10 @@ export interface NetPlayerState {
   max_block: number; parry_pct: number; charge_dur: number;
   /** 荆棘（受击反伤比例）/ 吸血（造成伤害回复固定值）/ 连续剑气（蓄力后追加发数） */
   thorn_pct: number; lifesteal: number; multi_wave: number;
+  /** 冲击力（攻击扣对方体力的倍率）/ 稳定性（受击扣自身体力的抗性） */
+  impact: number; stability: number;
+  /** 暴击率（0~1）/ 暴击伤害加成（暴击伤害 = 基础 × (1 + crit_dmg)） */
+  crit_rate: number; crit_dmg: number;
   /** 三选一状态（进行中非空）：抽到的 3 个增益索引 + 是否已选 */
   pick: { options: number[]; done: boolean } | null;
 }
@@ -203,12 +207,15 @@ export interface WorldPayload {
   zombies: NetZombieState[];
 }
 
+/** 伤害符号（与 PB DamageSign 枚举同构）：治疗 / 被闪避·格挡 / 正常 / 暴击 */
+export type DamageSign = -1 | 0 | 1 | 2;
+
 /** PB → PF 战斗事件（伤害 / 格挡 / 眩晕 / 击退等，瞬时效果触发） */
 export type MpEventPayload =
   | { kind: 'join'; uuid: string; name: string; color: string }
   | { kind: 'leave'; uuid: string; name: string }
-  | { kind: 'dmg_z'; id: number; amount: number; crit: boolean; by: string }
-  | { kind: 'dmg_p'; uuid: string; amount: number; by: string; interrupt: boolean }
+  | { kind: 'dmg_z'; id: number; amount: number; sign: DamageSign; by: string }
+  | { kind: 'dmg_p'; uuid: string; amount: number; sign: DamageSign; by: string; interrupt: boolean }
   | { kind: 'parry'; uuid: string; perfect: boolean; fail: boolean; drain: number; byZombie: boolean }
   | { kind: 'zstun'; id: number; mul: number }
   | { kind: 'zdie'; id: number }
@@ -225,6 +232,11 @@ export type MpEventPayload =
 export interface HeartbeatPayload {
   acq_connected: boolean;
   decode_rate_hz?: number;
+}
+
+/** 运维：PB 即将重启（自接管），客户端提示并等待重连 */
+export interface AdminRestartingPayload {
+  delay_ms: number;
 }
 
 export interface DecodeStatusPayload {
@@ -335,6 +347,7 @@ export interface StateRequestMsg extends BaseMessage { type: 'state_request'; pa
 export interface UiCommandMsg extends BaseMessage { type: 'ui_command'; payload: UiCommandPayload; }
 export interface MpInputMsg extends BaseMessage { type: 'mp_input'; payload: MpInputPayload; }
 export interface MpActionMsg extends BaseMessage { type: 'mp_action'; payload: MpActionPayload; }
+export interface AdminRestartMsg extends BaseMessage { type: 'admin_restart'; payload: Record<string, never>; }
 
 // ---- PB → SCB ----
 
@@ -344,6 +357,7 @@ export interface ConfigUpdateMsg extends BaseMessage { type: 'config_update'; pa
 
 export interface WorldMsg extends BaseMessage { type: 'world'; payload: WorldPayload; }
 export interface EventMsg extends BaseMessage { type: 'event'; payload: MpEventPayload; }
+export interface AdminRestartingMsg extends BaseMessage { type: 'admin_restarting'; payload: AdminRestartingPayload; }
 
 // ---------- 5. 通道消息集合 ----------
 
@@ -352,9 +366,9 @@ export type FromScb = HelloMsg | HeartbeatMsg | DeviceCommandMsg | DecodeStatusM
 /** PB 视角：发送给 SCB */
 export type ToScb = WelcomeMsg | CommandAckMsg | DeviceStateUpdateMsg | StateSnapshotMsg | ConfigUpdateMsg | ErrorMsg;
 /** PB 视角：从 PF 接收 */
-export type FromPf = HelloMsg | StateRequestMsg | UiCommandMsg | MpInputMsg | MpActionMsg;
+export type FromPf = HelloMsg | StateRequestMsg | UiCommandMsg | MpInputMsg | MpActionMsg | AdminRestartMsg;
 /** PB 视角：发送给 PF */
-export type ToPf = WelcomeMsg | StateSnapshotMsg | DeviceStateUpdateMsg | CommandAckMsg | ErrorMsg | WorldMsg | EventMsg;
+export type ToPf = WelcomeMsg | StateSnapshotMsg | DeviceStateUpdateMsg | CommandAckMsg | ErrorMsg | WorldMsg | EventMsg | AdminRestartingMsg;
 
 /** 按类型收窄消息（PF 侧常用） */
 export function isType<T extends ToPf['type']>(msg: ToPf, type: T): msg is Extract<ToPf, { type: T }> {

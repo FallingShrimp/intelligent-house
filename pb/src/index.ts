@@ -39,6 +39,7 @@ import type {
 	DeviceId,
 	DeviceState,
 	DeviceStateUpdatePayload,
+	AdminRestartingPayload,
 	ErrorCode,
 	ErrorPayload,
 	HelloPayload,
@@ -49,6 +50,7 @@ import type {
 	TriggerInfo,
 	UiCommandPayload,
 } from './protocol'
+import { AdminRestartPayloadSchema } from './protocol'
 import { COOLDOWN_MS, applyAction, createInitialDevices } from './devices'
 import { World } from './world'
 
@@ -61,8 +63,8 @@ const PORT = Number(process.env.PORT ?? 3000)
 const devices = new Map<string, DeviceState>(
 	createInitialDevices().map((d) => [d.device_id, d]),
 )
-/** 联机对战权威世界（玩家注册 / 僵尸 AI / 伤害裁决的唯一事实源） */
-const world = new World()
+/** 联机对战权威世界（玩家注册 / 僵尸 AI / 伤害裁决的唯一事实源；导出供冒烟测试同进程直读） */
+export const world = new World()
 /** 设备状态广播 update_id：PB 全局单调递增 */
 let updateId = 0
 /** client_id 分配计数器 */
@@ -447,9 +449,47 @@ function routeMessage(conn: Conn, raw: unknown): void {
 			world.action(conn.mpUuid, d)
 			return
 		}
+		case 'admin_restart': {
+			const p = AdminRestartPayloadSchema.safeParse(payload)
+			if (!p.success) {
+				sendError(conn, 'INVALID_FORMAT', `admin_restart payload 校验失败: ${zodSummary(p.error)}`, seq)
+				return
+			}
+			handleAdminRestart(conn)
+			return
+		}
 		default:
 			sendError(conn, 'UNKNOWN_TYPE', `未知消息 type: ${type}`, seq)
 	}
+}
+
+/**
+ * 重启 PB（自接管）：广播 admin_restarting → 300ms 后 spawn 新 PB 进程
+ * （携带 PB_TAKEOVER_PORT，新实例 listen 失败自动重试）→ 本进程退出。
+ * 已知影响：设备状态机随进程重置回初始快照，SCB 重连后按其实际状态重新同步。
+ */
+let restarting = false
+function handleAdminRestart(conn: Conn): void {
+	if (restarting) return // 幂等：重启流程进行中忽略重复请求
+	restarting = true
+	logger.warn({ client_id: conn.clientId }, '收到 admin_restart：PB 自接管重启')
+	const payload: AdminRestartingPayload = { delay_ms: 300 }
+	for (const c of conns.values()) {
+		if (!c.helloed) continue
+		sendMessage(c, 'admin_restarting', payload)
+	}
+	setTimeout(() => {
+		try {
+			const child = Bun.spawn([process.execPath, 'src/index.ts'], {
+				env: { ...process.env, PB_TAKEOVER_PORT: String(PORT) },
+				stdio: ['ignore', 'inherit', 'inherit'],
+			})
+			logger.warn({ child_pid: child.pid, port: PORT }, '新 PB 进程已拉起，本进程退出')
+		} catch (err) {
+			logger.error({ err: String(err) }, 'PB 自接管重启：spawn 失败')
+		}
+		process.exit(0)
+	}, 300)
 }
 
 // ---------- Elysia 应用 ----------
@@ -540,7 +580,18 @@ export function startWorldLoop(): () => void {
 
 if (import.meta.main) {
 	// 显式绑定全网卡：局域网设备的 PF 客户端需要经内网 IP 访问 WS
-	app.listen({ port: PORT, hostname: '0.0.0.0' })
+	// 自接管重启（PB_TAKEOVER_PORT）：旧进程退出端口释放有延迟 → listen 失败重试（200ms × 60）
+	const takeover = Boolean(process.env.PB_TAKEOVER_PORT)
+	for (let attempt = 0; ; attempt++) {
+		try {
+			app.listen({ port: PORT, hostname: '0.0.0.0' })
+			break
+		} catch (err) {
+			if (!takeover || attempt >= 60) throw err
+			logger.warn({ port: PORT, attempt: attempt + 1, err: String(err) }, 'listen 失败（接管重启），200ms 后重试')
+			await Bun.sleep(200)
+		}
+	}
 	logger.info(
 		{ port: app.server?.port, scb: `/ws/scb`, pf: `/ws/pf`, http: `/api/state` },
 		'PB 仿真状态层已启动',

@@ -240,13 +240,22 @@ export const MpActionPayloadSchema = z
 		segment: z.number().int().min(0).max(2).optional(),
 		/** wave 专用：蓄力时长 s（PB 按每秒 10 体力结算消耗） */
 		hold: z.number().min(0).max(10).optional(),
-		/** pick 专用：选择的增益索引（0-9，必须是 PF 分到的 3 项之一） */
-		idx: z.number().int().min(0).max(9).optional(),
+		/** pick 专用：选择的增益索引（0-14，必须是 PF 分到的 3 项之一） */
+		idx: z.number().int().min(0).max(14).optional(),
 		/** revive 专用：要复活的玩家 uuid */
 		target: z.string().min(1).optional(),
 	})
 	.strict()
 export type MpActionPayload = z.infer<typeof MpActionPayloadSchema>
+
+/** PF 专属：重启 PB 服务（仅 PF 通道可发，SCB 天然隔离） */
+export const AdminRestartPayloadSchema = z.object({}).strict()
+export type AdminRestartPayload = z.infer<typeof AdminRestartPayloadSchema>
+
+/** 下行广播：PB 即将重启（自接管），客户端应提示并等待重连 */
+export interface AdminRestartingPayload {
+	delay_ms: number
+}
 
 // ---------- 4. 消息信封 ----------
 
@@ -275,6 +284,7 @@ export const PF_PAYLOAD_SCHEMAS: Record<string, z.ZodTypeAny> = {
 	ui_command: UiCommandPayloadSchema,
 	mp_input: MpInputPayloadSchema,
 	mp_action: MpActionPayloadSchema,
+	admin_restart: AdminRestartPayloadSchema,
 }
 
 // ---------- 5. 下行 payload 类型（PB 发送侧，对齐 7.7 接口） ----------

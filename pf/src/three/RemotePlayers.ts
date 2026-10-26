@@ -3,8 +3,8 @@
  *
  * - 颜色由 PB 在连接时随机分配（welcome.you / world.players.color）
  * - 位置 / 朝向按 10Hz 快照插值；仅渲染 fp（第一人称）状态的玩家
- * - 动作标签（anim：swing0/1/2、counter、chase、block）驱动剑的挥砍动画与
- *   身体倾斜脉冲；格挡中脚下显示护盾环
+ * - 动作标签（anim：swing0/1/2、counter、chase、block、stab|<pitch>）驱动剑的挥砍动画与
+ *   身体倾斜脉冲；空中戳刺（stab）整体圆柱向目标俯仰方向倾斜；格挡中脚下显示护盾环
  * - 头顶血条（hp 来自 PB 权威快照）；命中溅血粒子（bleed）
  * - 死亡（hp=0）渲染为倒地尸体：横躺变暗 + 名牌 ☠ 标记，仍可被队友点击复活
  */
@@ -18,6 +18,9 @@ const BAR_W = 0.66   // 血条宽
 const BAR_H = 0.075
 const BAR_Y = 1.98   // 血条高度（名牌下方）
 
+const UP = new THREE.Vector3(0, 1, 0)
+const TILT_RESET = new THREE.Quaternion() // 直立姿态（恒等四元数）
+
 interface RemoteEntry {
 	uuid: string
 	name: string
@@ -28,6 +31,7 @@ interface RemoteEntry {
 	mat: THREE.MeshStandardMaterial
 	baseColor: THREE.Color
 	arm: THREE.Group // 手腕枢轴（剑挂在上面，动画驱动其旋转）
+	tilt: THREE.Group // 身体倾斜枢轴（空中戳刺 stab|pitch 驱动，外层 yaw 之内）
 	hp: number
 	maxHp: number
 	dead: boolean
@@ -190,12 +194,22 @@ export class RemotePlayers {
 			} else {
 				g.rotation.z += (0 - g.rotation.z) * k // 复活后从倒地姿态平滑起身
 			}
+			// 空中戳刺：身体向目标俯仰方向倾斜（顶面法向量 → 目标方向），结束 slerp 回直立
+			const stab = e.animTag?.startsWith('stab|') ?? false
+			if (stab && e.animT > 0) {
+				const pitch = parseFloat(e.animTag!.slice(5))
+				const dir = new THREE.Vector3(0, Math.sin(pitch), -Math.cos(pitch))
+				e.tilt.quaternion.slerp(new THREE.Quaternion().setFromUnitVectors(UP, dir), k)
+			} else {
+				e.tilt.quaternion.slerp(TILT_RESET, k)
+			}
 			// 剑动画：按动作标签驱动手腕枢轴旋转（p = 0→1 动画进度）
 			const arm = e.arm
 			if (e.animT > 0 && e.animTag) {
 				const p = 1 - e.animT / ANIM_DUR
 				const s = p * p * (3 - 2 * p) // smoothstep 缓动
-				switch (e.animTag) {
+				const pose = stab ? 'counter' : e.animTag // 戳刺复用反击手臂姿态
+				switch (pose) {
 					case 'swing0': // 左挥：绕 Y 从右往左扫
 						arm.rotation.set(Math.PI / 2 - 0.25, THREE.MathUtils.lerp(1.25, -1.05, s), 0)
 						break
@@ -285,7 +299,10 @@ export class RemotePlayers {
 		const cyl = new THREE.Mesh(new THREE.CylinderGeometry(CYL_R, CYL_R, CYL_H, 20), mat)
 		cyl.position.y = CYL_H / 2
 		cyl.castShadow = true
-		group.add(cyl)
+		// 身体倾斜枢轴：空中戳刺时整体倾斜（外层 yaw 之内，脚下护盾环不跟随）
+		const tilt = new THREE.Group()
+		group.add(tilt)
+		tilt.add(cyl)
 
 		// 头顶半球（区分朝向）
 		const head = new THREE.Mesh(
@@ -293,7 +310,7 @@ export class RemotePlayers {
 			new THREE.MeshStandardMaterial({ color, roughness: 0.5 }),
 		)
 		head.position.y = CYL_H
-		group.add(head)
+		tilt.add(head)
 
 		// 朝向指示（面前小方块）
 		const nose = new THREE.Mesh(
@@ -301,7 +318,7 @@ export class RemotePlayers {
 			new THREE.MeshStandardMaterial({ color: 0x222831 }),
 		)
 		nose.position.set(0, CYL_H - 0.15, CYL_R + 0.06)
-		group.add(nose)
+		tilt.add(nose)
 
 		// 格挡护盾环（脚下）
 		const shield = new THREE.Mesh(
@@ -318,7 +335,7 @@ export class RemotePlayers {
 		arm.position.set(CYL_R + 0.04, 1.15, 0.05)
 		arm.rotation.set(0.5, 0, 0) // idle：剑尖斜向前上
 		arm.add(buildRemoteSword())
-		group.add(arm)
+		tilt.add(arm)
 
 		// 名牌（canvas + 纹理存入 entry：死亡 ☠ 标记需原位重绘）
 		const labelCanvas = document.createElement('canvas')
@@ -355,7 +372,7 @@ export class RemotePlayers {
 
 		return {
 			uuid: p.uuid, name: p.name, group, cyl, label, shield, mat,
-			baseColor: color.clone(), arm, hp: p.hp, maxHp: p.max_hp || 100,
+			baseColor: color.clone(), arm, tilt, hp: p.hp, maxHp: p.max_hp || 100,
 			dead: p.hp <= 0, labelCanvas, labelTex, bar, barFill,
 			tX: p.p[0], tZ: p.p[2], tYaw: p.yaw,
 			animTag: p.anim, animT: 0,

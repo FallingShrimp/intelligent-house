@@ -1,9 +1,9 @@
 <script setup lang="ts">
 /**
  * 右下角连接状态栏：连接状态（已连接 / 重连中）、PB 地址、
- * update_id（乱序 / 丢包检测可见）与最近指令回执。
+ * update_id（乱序 / 丢包检测可见）、最近指令回执与 PB 重启按钮（二次确认）。
  */
-import { computed } from 'vue'
+import { computed, onBeforeUnmount, ref } from 'vue'
 import { useConnectionStore } from '../stores/connection'
 import { useDevicesStore } from '../stores/devices'
 import { pbClient } from '../ws/client'
@@ -23,6 +23,33 @@ const dotClass = computed(() => {
 })
 
 const updateIdText = computed(() => (devices.updateId >= 0 ? String(devices.updateId) : '—'))
+
+// ---------------- PB 重启（运维，二次确认） ----------------
+
+/** null = 未点击；true = 已点击等待确认（3s 未确认还原）；false = 已发出请求 */
+const restartState = ref<'idle' | 'confirm' | 'sent'>('idle')
+let confirmTimer = 0
+
+function onRestartClick() {
+  if (restartState.value === 'idle') {
+    restartState.value = 'confirm'
+    window.clearTimeout(confirmTimer)
+    confirmTimer = window.setTimeout(() => (restartState.value = 'idle'), 3000)
+    return
+  }
+  if (restartState.value === 'confirm') {
+    window.clearTimeout(confirmTimer)
+    restartState.value = 'sent'
+    pbClient.sendAdminRestart()
+  }
+}
+
+onBeforeUnmount(() => window.clearTimeout(confirmTimer))
+
+// 任何窗口收到 PB 重启广播（含其他客户端发起）→ 全部进入「重启中」提示态
+pbClient.onAdminRestarting = () => {
+  restartState.value = 'sent'
+}
 </script>
 
 <template>
@@ -30,6 +57,15 @@ const updateIdText = computed(() => (devices.updateId >= 0 ? String(devices.upda
     <div class="row">
       <span class="dot" :class="dotClass"></span>
       <span>{{ conn.statusText }}</span>
+      <!-- PB 自接管重启：首次点击进入确认态（3s 还原），再次点击才真正下发 -->
+      <button
+        class="restart-btn"
+        :class="{ confirm: restartState === 'confirm', sent: restartState === 'sent' }"
+        :disabled="restartState === 'sent'"
+        @click="onRestartClick"
+      >
+        {{ restartState === 'idle' ? '重启 PB' : restartState === 'confirm' ? '确认重启？' : 'PB 重启中…' }}
+      </button>
     </div>
     <div class="muted">{{ pbClient.url }}</div>
     <div v-if="conn.clientId" class="muted">client: {{ conn.clientId }}</div>
@@ -84,4 +120,29 @@ b { color: #8fd4ff; }
 .drop { color: #ffb340; font-size: 11px; }
 .ack-ok { color: #35d07f; font-size: 11px; }
 .ack-fail { color: #ff6a6a; font-size: 11px; word-break: break-all; }
+.restart-btn {
+  margin-left: auto;
+  border: 1px solid rgba(255, 106, 106, 0.55);
+  background: rgba(255, 106, 106, 0.12);
+  color: #ff8a8a;
+  font-size: 11px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.restart-btn:hover { background: rgba(255, 106, 106, 0.25); }
+.restart-btn.confirm {
+  background: #e63946;
+  border-color: #e63946;
+  color: #fff;
+  animation: blink 0.9s infinite;
+}
+.restart-btn.sent {
+  cursor: default;
+  opacity: 0.7;
+  color: #ffb340;
+  border-color: rgba(255, 179, 64, 0.55);
+  background: rgba(255, 179, 64, 0.12);
+}
 </style>

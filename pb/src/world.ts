@@ -63,7 +63,6 @@ const ZOMBIE_TTL_DEAD = 2.0
 const ZOMBIE_SPAWN = { x: -4.55, z: 1.9 }
 
 // 重击剑气（远程弹道）
-const WAVE_DMG = 30         // 基础 30（= 3×atk 基准，随攻击力与伤害增益缩放）
 const WAVE_SPEED = 12     // m/s
 const WAVE_TTL_S = 1.2    // 飞行寿命（约 14m 射程）
 const WAVE_RADIUS = 0.9   // 命中判定半径
@@ -92,9 +91,52 @@ interface Wave {
 	/** 剑气面基：c = 面内横轴，n = 面法线（随机 roll 绕飞行轴旋转，碰撞箱跟随） */
 	cx: number; cy: number; cz: number
 	nx: number; ny: number; nz: number
+	/** 发射时锁定的伤害值（atk × 300% × 有效蓄力 × 伤害倍率） */
+	dmg: number
 	t: number
 	reg: number
 	hits: string[]
+}
+
+/** 玩家词条键：一切可被三选一增益的数值统一挂在 MpPlayer.stats 中管理 */
+type StatKey =
+	| 'atk' | 'maxHp' | 'maxSt' | 'parryPct' | 'blockMaxS' | 'dmgMul'
+	| 'chargeSpd' | 'chargeMax' | 'thorn' | 'lifesteal' | 'multiWave'
+	| 'impact' | 'stability' | 'critRate' | 'critDmg'
+
+/** 词条初始值（与三选一档位一一对应，见 World.PICK_OPTIONS） */
+const STAT_DEFAULTS: Record<StatKey, number> = {
+	atk: 10, maxHp: P_MAX_HP, maxSt: P_MAX_ST, parryPct: 0.5, blockMaxS: 1.0,
+	dmgMul: 1, chargeSpd: 1, chargeMax: 1.0, thorn: 0, lifesteal: 0,
+	multiWave: 0, impact: 1, stability: 1, critRate: 0.05, critDmg: 1.0,
+}
+
+/** 百分比词条：加值后 ×100 取整防浮漂 */
+const PCT_STAT_KEYS: ReadonlySet<StatKey> = new Set([
+	'parryPct', 'dmgMul', 'chargeSpd', 'thorn', 'impact', 'stability', 'critRate', 'critDmg',
+])
+
+/** 三选一增益选项（表驱动） */
+interface PickOption {
+	label: string
+	key: StatKey
+	add: number
+}
+
+/** 伤害符号：治疗 / 被闪避·格挡 / 正常 / 暴击 */
+export enum DamageSign {
+	Heal = -1,
+	Blocked = 0,
+	Normal = 1,
+	Crit = 2,
+}
+
+/** 伤害对象：伤害不再是一个裸数字，携带来源 / 符号 / 冲击值走统一结算 */
+export interface DamageSource {
+	from: string          // 'p:<uuid>' | 'z:<id>' | 'sys'
+	amount: number        // 绝对值，>0
+	sign: DamageSign
+	impact: number        // 受击者扣除的体力基值（T2b 冲击力/稳定性公式挂点）
 }
 
 export interface MpPlayer {
@@ -122,17 +164,8 @@ export interface MpPlayer {
 	lastAttack: number
 	combo: number
 	kills: number
-	/** 击杀增益（三选一累积） */
-	atk: number          // 剑基础伤害（初始 10）
-	maxHp: number        // 血量上限（初始 100）
-	parryPct: number     // 完美格挡窗口 = 格挡最大时长 × 该比例（初始 0.5）
-	maxSt: number        // 体力上限（初始 100）
-	blockMaxS: number    // 格挡最大持续（初始 1.0s）
-	dmgMul: number       // 全局伤害倍率（初始 1）
-	chargeSpd: number    // 重击蓄力速度倍率（蓄力时长 = 1 / chargeSpd，初始 1）
-	thorn: number        // 荆棘：受击时反弹伤害 × 该比例（初始 0）
-	lifesteal: number    // 吸血：造成伤害回复固定血量（初始 0）
-	multiWave: number    // 连续剑气：蓄力发射后追加的剑气发数（初始 0）
+	/** 词条表：攻击力 / 上限 / 格挡 / 荆棘 / 吸血 / 暴击等全部增益数值 */
+	stats: Record<StatKey, number>
 	/** 连发剑气队列：剩余发数 + 下一发时刻（间隔 0.1s） */
 	waveQueue: number
 	waveNextAt: number
@@ -174,8 +207,8 @@ export interface MpZombie {
 export type MpEvent =
 	| { kind: 'join'; uuid: string; name: string; color: string }
 	| { kind: 'leave'; uuid: string; name: string }
-	| { kind: 'dmg_z'; id: number; amount: number; crit: boolean; by: string }
-	| { kind: 'dmg_p'; uuid: string; amount: number; by: string; interrupt: boolean }
+	| { kind: 'dmg_z'; id: number; amount: number; sign: DamageSign; by: string }
+	| { kind: 'dmg_p'; uuid: string; amount: number; sign: DamageSign; by: string; interrupt: boolean }
 	| { kind: 'parry'; uuid: string; perfect: boolean; fail: boolean; drain: number; byZombie: boolean }
 	| { kind: 'zstun'; id: number; mul: number }
 	| { kind: 'zdie'; id: number }
@@ -203,6 +236,8 @@ export interface WorldSnapshot {
 		kills: number
 		max_block: number; parry_pct: number; charge_dur: number
 		thorn_pct: number; lifesteal: number; multi_wave: number
+		impact: number; stability: number
+		crit_rate: number; crit_dmg: number
 		pick: { options: number[]; done: boolean } | null
 	}[]
 	zombies: {
@@ -244,9 +279,7 @@ export class World {
 			blocking: false, blockStart: 0, blockCdUntil: 0,
 			lastStaminaUse: -10, lastAttack: 0, combo: -1,
 			kills: 0,
-			atk: 10, maxHp: P_MAX_HP, parryPct: 0.5, maxSt: P_MAX_ST,
-			blockMaxS: 1.0, dmgMul: 1, chargeSpd: 1,
-			thorn: 0, lifesteal: 0, multiWave: 0,
+			stats: { ...STAT_DEFAULTS },
 			waveQueue: 0, waveNextAt: 0,
 			pick: null,
 			vy: 0, lastY: 1.6, lastInputAt: 0,
@@ -354,18 +387,25 @@ export class World {
 
 	private fireWave(p: MpPlayer, now: number, hold?: number): void {
 		if (p.stunUntil > now || now < p.guardBreakUntil) return
-		this.emitWave(p, now)
-		// 蓄力消耗：每秒 10 体力（发射时一次结算，随 hold 上限保护）
-		this.useStamina(p, 10 * Math.min(5, hold ?? 1), now)
+		// 有效蓄力时长：按住秒数 × 蓄力速度，钳到蓄力上限（伤害 = atk × 300% × effHold）
+		const effHold = Math.min((hold ?? 1) * p.stats.chargeSpd, p.stats.chargeMax)
+		this.emitWave(p, now, this.chargeWaveDmg(p, effHold))
+		// 蓄力消耗：每秒 10 体力（发射时一次结算，effHold 已被 chargeMax 钳制）
+		this.useStamina(p, 10 * effHold, now)
 		// 连续剑气：蓄力发射后每 0.1s 追发一发（眩晕 / 死亡时由 tick 中止）
-		if (p.multiWave > 0 && p.stunUntil <= now) {
-			p.waveQueue = p.multiWave
+		if (p.stats.multiWave > 0 && p.stunUntil <= now) {
+			p.waveQueue = p.stats.multiWave
 			p.waveNextAt = now + 0.1
 		}
 	}
 
+	/** 剑气伤害 = 攻击力 × 300% × 有效蓄力时长 × 全局伤害倍率 */
+	private chargeWaveDmg(p: MpPlayer, effHold: number): number {
+		return p.stats.atk * 3 * effHold * p.stats.dmgMul
+	}
+
 	/** 发射一发剑气：方向取当前准星 3D 朝向，绕飞行轴随机 roll 旋转碰撞箱与视觉 */
-	private emitWave(p: MpPlayer, now: number): void {
+	private emitWave(p: MpPlayer, now: number, dmg: number): void {
 		const [dx, dy, dz] = this.waveDir(p)
 		const roll = Math.random() * Math.PI * 2
 		const { c, n } = waveBasis(dx, dy, dz, roll)
@@ -375,7 +415,7 @@ export class World {
 		this.waves.push({
 			owner: p.uuid, x, y, z, dx, dy, dz,
 			cx: c[0], cy: c[1], cz: c[2], nx: n[0], ny: n[1], nz: n[2],
-			t: 0, reg: this.region(x, z), hits: [],
+			dmg, t: 0, reg: this.region(x, z), hits: [],
 		})
 		this.events.push({ kind: 'wave', by: p.uuid, x, y, z, dx, dy, dz, roll })
 	}
@@ -423,8 +463,16 @@ export class World {
 			for (const t of targets) {
 				if (!t.hit) continue
 				w.hits.push(t.key)
-				if (t.z) this.damageZombie(t.z, WAVE_DMG * by.atk / 10 * by.dmgMul, by, now)
-				else if (t.p) this.damagePlayer(t.p, WAVE_DMG * by.atk / 10 * by.dmgMul, by, now, false, true)
+				// 剑气暴击：每个目标独立掷点（与近战同一公式）
+				const crit = Math.random() < by.stats.critRate
+				const waveDmg: DamageSource = {
+					from: `p:${by.uuid}`,
+					amount: crit ? w.dmg * (1 + by.stats.critDmg) : w.dmg,
+					sign: crit ? DamageSign.Crit : DamageSign.Normal,
+					impact: 10,
+				}
+				if (t.z) this.damageZombie(t.z, waveDmg, by, now)
+				else if (t.p) this.damagePlayer(t.p, waveDmg, by, now, false, true)
 			}
 			if (w.t > WAVE_TTL_S) this.waves.splice(i, 1)
 		}
@@ -441,13 +489,10 @@ export class World {
 		const tgt = this.findMeleeTarget(p)
 		if (!tgt) return // 空挥
 
-		// 下落攻击：垂直速度 < -2 m/s（跳劈 / 俯冲）时伤害 ×200%
-		const airMul = p.vy < -2 ? 2 : 1
-
 		// 反击：僵尸眩晕窗口内
 		if (tgt.zombie && tgt.zombie.state === 'stunned' &&
 			now - tgt.zombie.stunStart <= COUNTER_WINDOW_S && tgt.dist <= COUNTER_REACH) {
-			this.damageZombie(tgt.zombie, p.atk * 3 * p.dmgMul * airMul, p, now)
+			this.damageZombie(tgt.zombie, this.playerHit(p, p.stats.atk * 3 * p.stats.dmgMul), p, now)
 			this.chaseLeft = 3
 			this.chaseUntil = now + CHASE_WINDOW_S
 			this.events.push({ kind: 'counter_open' })
@@ -456,14 +501,25 @@ export class World {
 		// 追击：全局追击窗口
 		if (this.chaseLeft > 0 && now <= this.chaseUntil) {
 			this.chaseLeft--
-			if (tgt.zombie) this.damageZombie(tgt.zombie, p.atk * 1.2 * p.dmgMul * airMul, p, now)
-			else this.damagePlayer(tgt.player!, p.atk * 1.2 * p.dmgMul * airMul, p, now, false)
+			if (tgt.zombie) this.damageZombie(tgt.zombie, this.playerHit(p, p.stats.atk * 1.2 * p.stats.dmgMul), p, now)
+			else this.damagePlayer(tgt.player!, this.playerHit(p, p.stats.atk * 1.2 * p.stats.dmgMul), p, now, false)
 			return
 		}
 		const segMul = COMBO_MUL[((segment % 3) + 3) % 3]
-		const dmg = p.atk * segMul * p.dmgMul * airMul
+		const dmg = this.playerHit(p, p.stats.atk * segMul * p.stats.dmgMul)
 		if (tgt.zombie) this.damageZombie(tgt.zombie, dmg, p, now)
 		else this.damagePlayer(tgt.player!, dmg, p, now, false)
+	}
+
+	/** 玩家攻击构造 DamageSource：掷暴击（命中 critRate → 伤害 ×(1+critDmg)） */
+	private playerHit(p: MpPlayer, amount: number): DamageSource {
+		const crit = Math.random() < p.stats.critRate
+		return {
+			from: `p:${p.uuid}`,
+			amount: crit ? amount * (1 + p.stats.critDmg) : amount,
+			sign: crit ? DamageSign.Crit : DamageSign.Normal,
+			impact: 10,
+		}
 	}
 
 	private findMeleeTarget(p: MpPlayer): { zombie: MpZombie | null; player: MpPlayer | null; dist: number } | null {
@@ -505,26 +561,26 @@ export class World {
 
 	// ---------------- 伤害结算 ----------------
 
-	private damageZombie(z: MpZombie, amount: number, by: MpPlayer, _now: number): void {
+	private damageZombie(z: MpZombie, dmg: DamageSource, by: MpPlayer, _now: number): void {
 		if (z.state === 'dead') return
 		// 嘶吼前摇中受到 ≥15 伤害 → 打断
-		if (z.state === 'roar' && amount >= 15) {
+		if (z.state === 'roar' && dmg.amount >= 15) {
 			z.state = 'recover'
 			z.stT = 0
 			z.recExtra = 0.55
 			this.events.push({ kind: 'roar_interrupt', id: z.id })
 		}
-		const dmg = z.vulnMul > 0 ? Math.round(amount * z.vulnMul) : amount
-		z.hp = Math.max(0, z.hp - dmg)
+		const amount = z.vulnMul > 0 ? Math.round(dmg.amount * z.vulnMul) : dmg.amount
+		z.hp = Math.max(0, z.hp - amount)
 		// 受击小击退
 		const dx = z.x - by.x
 		const dz = z.z - by.z
 		const d = Math.hypot(dx, dz) || 1
 		z.x += (dx / d) * 0.12
 		z.z += (dz / d) * 0.12
-		this.events.push({ kind: 'dmg_z', id: z.id, amount: dmg, crit: amount >= 12, by: by.uuid })
+		this.events.push({ kind: 'dmg_z', id: z.id, amount, sign: dmg.sign, by: by.uuid })
 		// 吸血：造成伤害回复固定血量
-		if (by.lifesteal > 0 && by.hp > 0) by.hp = Math.min(by.maxHp, by.hp + by.lifesteal)
+		if (by.stats.lifesteal > 0 && by.hp > 0) by.hp = Math.min(by.stats.maxHp, by.hp + by.stats.lifesteal)
 		if (z.hp <= 0) {
 			z.state = 'dead'
 			z.deadAt = this.now()
@@ -536,11 +592,23 @@ export class World {
 
 	// ---------------- 击杀三选一（全员选完才恢复） ----------------
 
-	/** 增益选项定义（索引即协议值） */
-	static readonly PICK_OPTIONS = [
-		'攻击力 +5', '血量上限 +20', '完美格挡窗口 +2%',
-		'体力上限 +10', '格挡最大持续 +0.25s', '所有伤害 +10%', '重击蓄力速度 +15%',
-		'荆棘 +15%', '吸血 +2', '连续剑气 +1',
+	/** 增益选项定义（表驱动，索引即协议值；label 与 PF BuffPickModal.LABELS 对齐） */
+	static readonly PICK_OPTIONS: PickOption[] = [
+		{ label: '攻击力 +5', key: 'atk', add: 5 },
+		{ label: '血量上限 +20', key: 'maxHp', add: 20 },
+		{ label: '完美格挡窗口 +2%', key: 'parryPct', add: 0.02 },
+		{ label: '体力上限 +10', key: 'maxSt', add: 10 },
+		{ label: '格挡最大持续 +0.25s', key: 'blockMaxS', add: 0.25 },
+		{ label: '所有伤害 +10%', key: 'dmgMul', add: 0.1 },
+		{ label: '重击蓄力速度 +15%', key: 'chargeSpd', add: 0.15 },
+		{ label: '荆棘 +15%', key: 'thorn', add: 0.15 },
+		{ label: '吸血 +2', key: 'lifesteal', add: 2 },
+		{ label: '连续剑气 +1', key: 'multiWave', add: 1 },
+		{ label: '蓄力上限 +0.25s', key: 'chargeMax', add: 0.25 },
+		{ label: '冲击力 +15%', key: 'impact', add: 0.15 },
+		{ label: '稳定性 +15%', key: 'stability', add: 0.15 },
+		{ label: '暴击率 +5%', key: 'critRate', add: 0.05 },
+		{ label: '暴击伤害 +25%', key: 'critDmg', add: 0.25 },
 	]
 
 	/** 僵尸被击败：房间内所有第一人称玩家进入三选一（每人独立随机抽 3 项） */
@@ -562,31 +630,22 @@ export class World {
 		return true
 	}
 
-	/** 应用增益并结束选择阶段 */
+	/** 应用增益并结束选择阶段（表驱动；maxHp/maxSt 按比例回补当前值，百分比词条 ×100 取整防浮漂） */
 	private applyPicks(): void {
 		for (const p of this.players.values()) {
 			const pick = p.pick
 			if (!pick || pick.choice === null) continue
-			const oldMaxHp = p.maxHp
-			const oldMaxSt = p.maxSt
-			switch (pick.choice) {
-				case 0: p.atk += 5; break
-				case 1:
-					p.maxHp += 20
-					p.hp = Math.round((p.hp / oldMaxHp) * p.maxHp) // 血量百分比不变
-					break
-				case 2: p.parryPct = Math.min(1, p.parryPct + 0.02); break
-				case 3:
-					p.maxSt += 10
-					p.stamina = Math.round((p.stamina / oldMaxSt) * p.maxSt)
-					break
-				case 4: p.blockMaxS += 0.25; break
-				case 5: p.dmgMul = Math.round((p.dmgMul + 0.1) * 100) / 100; break
-				case 6: p.chargeSpd = Math.round((p.chargeSpd + 0.15) * 100) / 100; break
-				case 7: p.thorn = Math.round((p.thorn + 0.15) * 100) / 100; break
-				case 8: p.lifesteal += 2; break
-				case 9: p.multiWave += 1; break
-			}
+			const opt = World.PICK_OPTIONS[pick.choice]
+			const backfillFrom = opt.key === 'maxHp' ? p.stats.maxHp : opt.key === 'maxSt' ? p.stats.maxSt : 0
+			const cur = p.stats[opt.key]
+			p.stats[opt.key] = PCT_STAT_KEYS.has(opt.key)
+				? Math.round((cur + opt.add) * 100) / 100
+				: cur + opt.add
+			// 上限类：当前值按原比例回补（血量 / 体力百分比不变）
+			if (opt.key === 'maxHp') p.hp = Math.round((p.hp / backfillFrom) * p.stats.maxHp)
+			if (opt.key === 'maxSt') p.stamina = Math.round((p.stamina / backfillFrom) * p.stats.maxSt)
+			// 概率词条封顶 100%
+			if (opt.key === 'parryPct' || opt.key === 'critRate') p.stats[opt.key] = Math.min(1, p.stats[opt.key])
 			p.pick = null
 		}
 	}
@@ -621,8 +680,8 @@ export class World {
 		if (t.mode !== 'fp' || t.hp > 0) return '目标不是尸体'
 		if (Math.hypot(t.x - by.x, t.z - by.z) > 3) return '距离尸体太远'
 		const now = this.now()
-		t.hp = t.maxHp
-		t.stamina = t.maxSt
+		t.hp = t.stats.maxHp
+		t.stamina = t.stats.maxSt
 		t.exhaustUntil = 0
 		t.blocking = false
 		t.blockStart = 0
@@ -633,53 +692,53 @@ export class World {
 	}
 
 	/** 对玩家造成伤害：格挡评估 → 扣血 → 死亡重生（PVP 与僵尸攻击共用） */
-	private damagePlayer(v: MpPlayer, amount: number, by: MpPlayer | null, now: number, fromZombie: boolean, isWave = false): void {
+	private damagePlayer(v: MpPlayer, dmg: DamageSource, by: MpPlayer | null, now: number, fromZombie: boolean, isWave = false): void {
 		if (v.hp <= 0) return
 		if (v.stunUntil > now) {
-			if (isWave) this.useStamina(v, 10, now) // 被剑气命中扣体力
-			this.hurtPlayer(v, amount, now, false, by)
+			if (isWave) this.useStamina(v, dmg.impact, now, by) // 被剑气命中扣体力
+			this.hurtPlayer(v, dmg, now, by)
 			return
 		}
 		if (v.blocking) {
 			const age = now - v.blockStart
-			if (age <= v.blockMaxS * v.parryPct) {
+			if (age <= v.stats.blockMaxS * v.stats.parryPct) {
 				// 完美格挡：攻击者 -20 体力（玩家攻击者进入 0.5s 硬直），格挡者无伤
 				if (!fromZombie && by) {
-					this.useStamina(by, 20, now)
+					this.useStamina(by, 20, now, v) // 反噬量随格挡者冲击力 / 攻击者稳定性缩放
 					by.guardBreakUntil = now + 0.5
 					this.events.push({ kind: 'guardbreak', uuid: by.uuid, dur: 0.5 })
 				}
 				// 完美格挡剑气：格挡者恢复 30 血量（上限 100）
-				if (isWave) v.hp = Math.min(v.maxHp, v.hp + 30)
+				if (isWave) v.hp = Math.min(v.stats.maxHp, v.hp + 30)
 				this.events.push({ kind: 'parry', uuid: v.uuid, perfect: true, fail: false, drain: 20, byZombie: fromZombie })
 				this.registerBlock(v, now)
 				return
 			}
 			if (Math.random() < 0.25) {
 				this.events.push({ kind: 'parry', uuid: v.uuid, perfect: false, fail: true, drain: 0, byZombie: fromZombie })
-				if (isWave) this.useStamina(v, 10, now) // 被剑气命中扣体力
-				this.hurtPlayer(v, amount, now, false, by)
+				if (isWave) this.useStamina(v, dmg.impact, now, by) // 被剑气命中扣体力
+				this.hurtPlayer(v, dmg, now, by)
 				return
 			}
-			this.useStamina(v, 10, now)
+			this.useStamina(v, dmg.impact, now, by)
 			this.events.push({ kind: 'parry', uuid: v.uuid, perfect: false, fail: false, drain: 10, byZombie: fromZombie })
 			this.registerBlock(v, now)
 			return
 		}
-		if (isWave) this.useStamina(v, 10, now) // 被剑气命中扣体力
-		this.hurtPlayer(v, amount, now, false, by)
+		if (isWave) this.useStamina(v, dmg.impact, now, by) // 被剑气命中扣体力
+		this.hurtPlayer(v, dmg, now, by)
 	}
 
 	/** 僵尸攻击玩家（含完美格挡对僵尸的反噬：-20 体力 + 踉跄） */
-	private damagePlayerByZombie(z: MpZombie, v: MpPlayer, amount: number, now: number): void {
+	private damagePlayerByZombie(z: MpZombie, v: MpPlayer, dmg: DamageSource, now: number): void {
 		if (v.hp <= 0) return
 		if (v.stunUntil > now) {
-			this.hurtPlayer(v, amount, now, false, null, z)
+			this.hurtPlayer(v, dmg, now, null, z)
 			return
 		}
 		if (v.blocking) {
 			const age = now - v.blockStart
-			if (age <= v.blockMaxS * v.parryPct) {
+			if (age <= v.stats.blockMaxS * v.stats.parryPct) {
 				z.stamina = Math.max(0, z.stamina - 20)
 				const drained = z.stamina <= 0
 				if (z.state === 'recover') z.recExtra += 0.5 // 踉跄：延长后摇
@@ -690,30 +749,31 @@ export class World {
 			}
 			if (Math.random() < 0.25) {
 				this.events.push({ kind: 'parry', uuid: v.uuid, perfect: false, fail: true, drain: 0, byZombie: true })
-				this.hurtPlayer(v, amount, now, false, null, z)
+				this.hurtPlayer(v, dmg, now, null, z)
 				return
 			}
-			this.useStamina(v, 10, now)
+			this.useStamina(v, dmg.impact, now, z)
 			this.events.push({ kind: 'parry', uuid: v.uuid, perfect: false, fail: false, drain: 10, byZombie: true })
 			this.registerBlock(v, now)
 			return
 		}
-		this.hurtPlayer(v, amount, now, false, null)
+		this.hurtPlayer(v, dmg, now, null)
 	}
 
 	/** 玩家掉血落地结算：荆棘反伤 / 吸血回复 / 死亡清理 */
-	private hurtPlayer(v: MpPlayer, amount: number, now: number, _interrupt: boolean, byPlayer: MpPlayer | null, byZombie: MpZombie | null = null): void {
-		v.hp = Math.max(0, v.hp - amount)
-		this.events.push({ kind: 'dmg_p', uuid: v.uuid, amount, by: byPlayer?.uuid ?? '', interrupt: false })
+	private hurtPlayer(v: MpPlayer, dmg: DamageSource, now: number, byPlayer: MpPlayer | null, byZombie: MpZombie | null = null): void {
+		v.hp = Math.max(0, v.hp - dmg.amount)
+		this.events.push({ kind: 'dmg_p', uuid: v.uuid, amount: dmg.amount, sign: dmg.sign, by: byPlayer?.uuid ?? dmg.from, interrupt: false })
 		// 荆棘：伤害发出者受到「伤害 × 荆棘」等量反伤（直伤，不触发对方格挡 / 再反伤）
-		const refl = Math.round(amount * v.thorn)
+		const refl = Math.round(dmg.amount * v.stats.thorn)
 		if (refl > 0) {
-			if (byZombie) this.damageZombie(byZombie, refl, v, now)
-			else if (byPlayer) this.reflectDamage(byPlayer, refl, v.uuid)
+			const thornDmg: DamageSource = { from: `p:${v.uuid}`, amount: refl, sign: DamageSign.Normal, impact: 0 }
+			if (byZombie) this.damageZombie(byZombie, thornDmg, v, now)
+			else if (byPlayer) this.reflectDamage(byPlayer, thornDmg)
 		}
 		// 吸血：伤害发出者（玩家）回复固定血量
-		if (byPlayer && byPlayer.lifesteal > 0 && byPlayer.hp > 0) {
-			byPlayer.hp = Math.min(byPlayer.maxHp, byPlayer.hp + byPlayer.lifesteal)
+		if (byPlayer && byPlayer.stats.lifesteal > 0 && byPlayer.hp > 0) {
+			byPlayer.hp = Math.min(byPlayer.stats.maxHp, byPlayer.hp + byPlayer.stats.lifesteal)
 		}
 		if (v.hp <= 0) {
 			// 死亡：保持死亡状态等待玩家手动复活（PF 死亡覆盖层 → mp_action respawn）
@@ -726,10 +786,10 @@ export class World {
 	}
 
 	/** 荆棘反伤直伤：不触发格挡 / 荆棘 / 吸血（避免递归） */
-	private reflectDamage(t: MpPlayer, amount: number, sourceUuid: string): void {
+	private reflectDamage(t: MpPlayer, dmg: DamageSource): void {
 		if (t.hp <= 0) return
-		t.hp = Math.max(0, t.hp - amount)
-		this.events.push({ kind: 'dmg_p', uuid: t.uuid, amount, by: sourceUuid, interrupt: false })
+		t.hp = Math.max(0, t.hp - dmg.amount)
+		this.events.push({ kind: 'dmg_p', uuid: t.uuid, amount: dmg.amount, sign: dmg.sign, by: dmg.from, interrupt: false })
 		if (t.hp <= 0) {
 			t.stunUntil = 0
 			t.exhaustUntil = 0
@@ -746,8 +806,8 @@ export class World {
 		const zombiesAlive = this.zombies.some((z) => z.state !== 'dead')
 		const aliveOthers = inRoom.filter((q) => q.uuid !== p.uuid && q.hp > 0).length
 		if (inRoom.length > 1 && zombiesAlive && aliveOthers > 0) return
-		p.hp = p.maxHp
-		p.stamina = p.maxSt
+		p.hp = p.stats.maxHp
+		p.stamina = p.stats.maxSt
 		p.stunUntil = now + 1.2
 		p.exhaustUntil = 0
 		p.blocking = false
@@ -757,8 +817,11 @@ export class World {
 		this.events.push({ kind: 'respawn', uuid: p.uuid, pos: [p.x, p.y, p.z] })
 	}
 
-	private useStamina(p: MpPlayer, n: number, now: number): void {
-		p.stamina = Math.max(0, p.stamina - n)
+	/** 扣体力：扣除量 = 基值 × 攻击者冲击力 / 受击者稳定性（僵尸无词条恒 1；无攻击者冲击力按 100%） */
+	private useStamina(p: MpPlayer, n: number, now: number, attacker?: MpPlayer | MpZombie | null): void {
+		const ai = attacker && 'stats' in attacker ? attacker.stats.impact : 1
+		const cost = (n * ai) / p.stats.stability
+		p.stamina = Math.max(0, p.stamina - cost)
 		p.lastStaminaUse = now
 		if (p.stamina <= 0) {
 			p.stunUntil = now + P_STUN_S
@@ -812,8 +875,9 @@ export class World {
 		this.events.push({ kind: 'zstun', id: z.id, mul: z.vulnMul })
 	}
 
-	private spendZ(z: MpZombie, n: number, now: number): boolean {
-		z.stamina = Math.max(0, z.stamina - n)
+	/** 僵尸动作成本：受攻击目标玩家的冲击力加成（僵尸稳定性恒 1，与 useStamina 公式对齐） */
+	private spendZ(z: MpZombie, n: number, now: number, attacker?: MpPlayer | null): boolean {
+		z.stamina = Math.max(0, z.stamina - n * (attacker ? attacker.stats.impact : 1))
 		if (z.stamina <= 0) {
 			this.zombieStun(z, now)
 			return true
@@ -903,9 +967,9 @@ export class World {
 					// 落手：对当前最近玩家结算
 					const v = this.nearestPlayer(z)
 					if (v && Math.hypot(v.x - z.x, v.z - z.z) <= Z_STRIKE_RANGE && Math.abs(v.y - 1.0) < 2.2) {
-						this.damagePlayerByZombie(z, v, 10, now)
+						this.damagePlayerByZombie(z, v, { from: `z:${z.id}`, amount: 10, sign: DamageSign.Normal, impact: 10 }, now)
 					}
-					if (!this.spendZ(z, Z_ATTACK_COST, now)) {
+					if (!this.spendZ(z, Z_ATTACK_COST, now, p)) {
 						z.state = 'recover'; z.stT = 0; z.recExtra = 0
 					}
 				}
@@ -926,16 +990,16 @@ export class World {
 						while (va > Math.PI) va = Math.abs(va - Math.PI * 2)
 						if (va <= Math.PI / 2 + 0.15 && vd <= SWEEP_RANGE && v.y - 1.0 < 1.8) {
 							const wasBlocking = v.blocking
-							this.hurtPlayer(v, 12, now, false, null)
+							this.hurtPlayer(v, { from: `z:${z.id}`, amount: 12, sign: DamageSign.Normal, impact: 0 }, now, null)
 							if (wasBlocking) {
 								v.blocking = false
 								v.guardBreakUntil = now + GUARD_BREAK_S
-								this.useStamina(v, SWEEP_BLOCK_STAMINA, now)
+								this.useStamina(v, SWEEP_BLOCK_STAMINA, now, z)
 								this.events.push({ kind: 'guardbreak', uuid: v.uuid, dur: GUARD_BREAK_S })
 							}
 						}
 					}
-					if (!this.spendZ(z, SWEEP_COST, now)) {
+					if (!this.spendZ(z, SWEEP_COST, now, p)) {
 						z.sweepCdUntil = now + SWEEP_CD
 						z.state = 'recover'; z.stT = 0; z.recExtra = 0
 					}
@@ -971,7 +1035,7 @@ export class World {
 						z.lungeHits.add(v.uuid)
 						hit = true
 						const vd = Math.hypot(v.x - z.x, v.z - z.z) || 1
-						this.hurtPlayer(v, 14, now, true, null)
+						this.hurtPlayer(v, { from: `z:${z.id}`, amount: 14, sign: DamageSign.Normal, impact: 0 }, now, null)
 						this.events.push({ kind: 'knockback', uuid: v.uuid, dx: (v.x - z.x) / vd, dz: (v.z - z.z) / vd, speed: 6.5 })
 						if (v.blocking) {
 							v.blocking = false
@@ -980,7 +1044,7 @@ export class World {
 					}
 				}
 				if (hit || remain <= 0.05 || z.dashT >= LUNGE_TIMEOUT) {
-					if (!this.spendZ(z, LUNGE_COST, now)) {
+					if (!this.spendZ(z, LUNGE_COST, now, p)) {
 						z.lungeCdUntil = now + LUNGE_CD
 						z.state = 'recover'; z.stT = 0; z.recExtra = hit ? 0 : 0.55
 					}
@@ -993,7 +1057,7 @@ export class World {
 					for (const v of this.players.values()) {
 						if (v.mode !== 'fp' || v.hp <= 0) continue
 						if (Math.hypot(v.x - z.x, v.z - z.z) <= ROAR_RADIUS) {
-							this.useStamina(v, ROAR_STAMINA, now)
+							this.useStamina(v, ROAR_STAMINA, now, z)
 							this.events.push({ kind: 'slow', uuid: v.uuid, dur: 1.0 })
 						}
 					}
@@ -1086,23 +1150,23 @@ export class World {
 			// 体力耗尽眩晕到期 → 体力恢复到 100%
 			if (p.exhaustUntil > 0 && now >= p.exhaustUntil) {
 				p.exhaustUntil = 0
-				if (p.hp > 0) p.stamina = p.maxSt
+				if (p.hp > 0) p.stamina = p.stats.maxSt
 			}
-			// 连续剑气：每 0.1s 追发一发（眩晕 / 死亡中止）
+			// 连续剑气：每 0.1s 追发一发（眩晕 / 死亡中止），伤害等同满蓄力
 			if (p.waveQueue > 0 && now >= p.waveNextAt) {
 				if (p.hp <= 0 || p.stunUntil > now) {
 					p.waveQueue = 0
 				} else {
-					this.emitWave(p, now)
+					this.emitWave(p, now, this.chargeWaveDmg(p, p.stats.chargeMax))
 					p.waveQueue--
 					p.waveNextAt = now + 0.1
 				}
 			}
 			if (
-				!p.blocking && p.stamina < p.maxSt &&
+				!p.blocking && p.stamina < p.stats.maxSt &&
 				p.stunUntil < now && now - p.lastStaminaUse > P_REGEN_DELAY
 			) {
-				p.stamina = Math.min(p.maxSt, p.stamina + P_REGEN * dt)
+				p.stamina = Math.min(p.stats.maxSt, p.stamina + P_REGEN * dt)
 			}
 		}
 		// 僵尸 AI
@@ -1133,13 +1197,15 @@ export class World {
 				yaw: round2(p.yaw),
 				fp: p.mode === 'fp',
 				hp: Math.round(p.hp), st: Math.round(p.stamina),
-				max_hp: p.maxHp, max_st: p.maxSt, atk: p.atk, dmg_mul: p.dmgMul,
+				max_hp: p.stats.maxHp, max_st: p.stats.maxSt, atk: p.stats.atk, dmg_mul: p.stats.dmgMul,
 				stun_for: Math.max(0, round2(p.stunUntil - now)),
 				blocking: p.blocking,
 				anim: p.anim,
 				kills: p.kills,
-				max_block: p.blockMaxS, parry_pct: p.parryPct, charge_dur: round2(1 / p.chargeSpd),
-				thorn_pct: p.thorn, lifesteal: p.lifesteal, multi_wave: p.multiWave,
+				max_block: p.stats.blockMaxS, parry_pct: p.stats.parryPct, charge_dur: round2(p.stats.chargeMax / p.stats.chargeSpd),
+				thorn_pct: p.stats.thorn, lifesteal: p.stats.lifesteal, multi_wave: p.stats.multiWave,
+				impact: p.stats.impact, stability: p.stats.stability,
+				crit_rate: p.stats.critRate, crit_dmg: p.stats.critDmg,
 				pick: p.pick ? { options: p.pick.options, done: p.pick.choice !== null } : null,
 			})),
 			zombies: this.zombies.map((z) => ({

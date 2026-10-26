@@ -9,8 +9,14 @@
  * 5. 友伤：攻击其他玩家 → dmg_p 事件
  * 6. 完美格挡：对方 parry_start 后立即受击 → parry(perfect) + 攻击者 guardbreak
  * 7. 断开连接 → leave 事件 + 快照移除玩家
+ * 8. 重击剑气蓄力：hold=0.5 → 伤害 15×dmgMul；hold=2 钳到蓄力上限 1.0 → 30×dmgMul
+ * 9. 暴击：critRate=1 连击全部 sign=2（伤害 ×(1+critDmg)）；critRate=0 恢复 sign=1
+ * 10. 冲击力：玩家 impact=1.5 → 僵尸落手扣体 10×1.5=15
+ *
+ * 用例 8-10 通过同进程导出的 world 单例做确定性铺垫（关暴击 / 摆僵尸位 / 设词条），
+ * 战斗结算本身仍走完整协议链路（mp_input / mp_action → PB 裁决 → 事件广播）。
  */
-import { app, logger, startWorldLoop } from '../src/index'
+import { app, logger, startWorldLoop, world } from '../src/index'
 
 logger.level = 'silent'
 
@@ -297,6 +303,87 @@ async function main(): Promise<void> {
       const leave = await recvWhere(a, (m) => m.type === 'event' && m.payload.kind === 'leave' && m.payload.uuid === uuidB, 'leave(B)')
       assert(leave.payload.name === '玩家B', 'leave 事件携带玩家名')
       await waitWorld(a, (w) => !w.players.some((p: AnyMsg) => p.uuid === uuidB), '快照移除 B')
+    })) && ok
+
+  // ---------- 用例 8-10：T2a/T2b/T2c 词条结算（同进程 world 铺垫 + 协议链路结算） ----------
+
+  ok =
+    (await step('重击剑气蓄力：hold=0.5 → 伤害 15；hold=2 钳到蓄力上限 1.0 → 30', async () => {
+      const pa = world.players.get(uuidA)!
+      const z = world.zombies[0]
+      assert(!!pa && !!z, 'world 单例可读（A 玩家 + 僵尸存在）')
+      pa.stats.critRate = 0 // 关闭暴击，伤害断言确定化（默认 5% 暴击会污染数值）
+      // A 朝 +x，僵尸摆在正前方：剑气 12m/s、10Hz tick（步长 1.2m = 命中窗口宽），
+      // 与僵尸距离存在 ~7% 相位错开概率 → 未命中则重摆僵尸重射（按期望伤害过滤事件）
+      input(a, [-3.0, 1.6, 1.9], [1, 0], 'fp')
+      const fireUntilHit = async (hold: number, expect: number, desc: string): Promise<AnyMsg> => {
+        for (let i = 0; i < 8; i++) {
+          z.x = -1.0; z.z = 1.9
+          send(a, 'mp_action', nextSeq(), { kind: 'wave', hold })
+          try {
+            return await recvWhere(a, (m) => m.type === 'event' && m.payload.kind === 'dmg_z' &&
+              m.payload.by === uuidA && m.payload.amount === expect, desc, 700)
+          } catch {
+            // 本发相位错开未命中 → 重试（残留飞行中的剑气迟到命中也会被期望值过滤正确匹配）
+          }
+        }
+        throw new Error(`剑气 8 次尝试均未命中: ${desc}`)
+      }
+      const d1 = await fireUntilHit(0.5, 15, '剑气 dmg_z(hold=0.5)')
+      assert(d1.payload.amount === 15 && d1.payload.sign === 1, `10×3×0.5×dmgMul=15（实际 ${d1.payload.amount}, sign ${d1.payload.sign}）`)
+      // 第二发：hold=2 → effHold = min(2×chargeSpd, chargeMax=1.0) = 1.0 → 10×3×1.0 = 30
+      const d2 = await fireUntilHit(2, 30, '剑气 dmg_z(hold=2)')
+      assert(d2.payload.amount === 30 && d2.payload.sign === 1, `蓄力钳制 → 10×3×1.0×dmgMul=30（实际 ${d2.payload.amount}, sign ${d2.payload.sign}）`)
+    })) && ok
+
+  ok =
+    (await step('暴击：critRate=1 连击全暴（sign=2，伤害×(1+critDmg)）；critRate=0 恢复 sign=1', async () => {
+      const pa = world.players.get(uuidA)!
+      const z = world.zombies[0]
+      pa.stats.critRate = 1
+      // 瞄准僵尸当前位置再出手（近战为朝向锥形判定）
+      const aim = () => {
+        const dx = z.x - pa.x, dz = z.z - pa.z
+        const l = Math.hypot(dx, dz) || 1
+        input(a, [-3.0, 1.6, 1.9], [dx / l, dz / l], 'fp')
+      }
+      await sleep(400)
+      aim()
+      send(a, 'mp_action', nextSeq(), { kind: 'attack', segment: 0 }) // 10×0.9=9 → 暴击 18
+      const c1 = await recvWhere(a, (m) => m.type === 'event' && m.payload.kind === 'dmg_z' && m.payload.by === uuidA, '暴击 dmg_z(seg0)')
+      assert(c1.payload.sign === 2 && c1.payload.amount === 18, `seg0 暴击 9×(1+1.0)=18（实际 ${c1.payload.amount}, sign ${c1.payload.sign}）`)
+      await sleep(400)
+      aim()
+      send(a, 'mp_action', nextSeq(), { kind: 'attack', segment: 2 }) // 10×1.5=15 → 暴击 30
+      const c2 = await recvWhere(a, (m) => m.type === 'event' && m.payload.kind === 'dmg_z' && m.payload.by === uuidA, '暴击 dmg_z(seg2)')
+      assert(c2.payload.sign === 2 && c2.payload.amount === 30, `seg2 暴击 15×(1+1.0)=30（实际 ${c2.payload.amount}, sign ${c2.payload.sign}）`)
+      pa.stats.critRate = 0
+      await sleep(400)
+      aim()
+      send(a, 'mp_action', nextSeq(), { kind: 'attack', segment: 0 })
+      const n1 = await recvWhere(a, (m) => m.type === 'event' && m.payload.kind === 'dmg_z' && m.payload.by === uuidA, '正常 dmg_z')
+      assert(n1.payload.sign === 1 && n1.payload.amount === 9, `critRate=0 恢复正常 9（实际 ${n1.payload.amount}, sign ${n1.payload.sign}）`)
+    })) && ok
+
+  ok =
+    (await step('冲击力：玩家 impact=1.5 → 僵尸落手扣体 10×1.5=15', async () => {
+      const pa = world.players.get(uuidA)!
+      const z = world.zombies[0]
+      pa.stats.impact = 1.5
+      // 轮询本地 world（同进程）：chase 期间压制 sweep 请求，等一次普通挥击 windup
+      // （windup 前摇 1s，落手时 spendZ(10)×impact 与伤害同 tick 结算，之后转 recover）
+      const deadline = Date.now() + 10000
+      let st0 = -1
+      while (Date.now() < deadline) {
+        await sleep(40)
+        if (z.state === 'chase') z.requestSweep = false
+        if (z.state === 'windup') { st0 = z.stamina; break }
+      }
+      assert(st0 >= 0, '僵尸进入 windup（10s 内）')
+      while (z.state === 'windup') await sleep(20) // 等落手结束（状态离开 windup）
+      const drop = Math.round((st0 - z.stamina) * 100)
+      assert(drop === 1500, `僵尸扣体 = Z_ATTACK_COST 10 × 1.5 = 15（实际 ${st0.toFixed(2)} → ${z.stamina.toFixed(2)}，差 ${(drop / 100).toFixed(2)}）`)
+      pa.stats.impact = 1
     })) && ok
 
   // ---------- 清理并退出 ----------

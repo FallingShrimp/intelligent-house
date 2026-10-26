@@ -10,6 +10,7 @@ import {
 	PROTOCOL_VERSION,
 	isType,
 	type Action,
+	type AdminRestartingPayload,
 	type CommandParams,
 	type DeviceId,
 	type MpActionPayload,
@@ -65,6 +66,8 @@ export class PbClient {
 	/** 联机对战：世界快照 / 战斗事件回调（SceneManager 注册） */
 	onWorld?: (payload: WorldPayload) => void
 	onMpEvent?: (payload: MpEventPayload) => void
+	/** 运维：PB 即将重启（自接管） */
+	onAdminRestarting?: (payload: AdminRestartingPayload) => void
 
 	constructor(url: string = resolvePbUrl()) {
 		this.url = url
@@ -113,6 +116,11 @@ export class PbClient {
 		this.send('mp_action', payload)
 	}
 
+	/** 运维：请求重启 PB 服务（自接管重启） */
+	sendAdminRestart() {
+		this.send('admin_restart', {})
+	}
+
 	/** 请求全量快照（重连后 / 手动刷新） */
 	requestState() {
 		const payload: StateRequestPayload = {}
@@ -140,9 +148,9 @@ export class PbClient {
 		return this.seqCounter++
 	}
 
-	/** PF → PB 可发送的消息类型（docs 7.5 + 联机对战 mp_input/mp_action） */
+	/** PF → PB 可发送的消息类型（docs 7.5 + 联机对战 mp_input/mp_action + 运维 admin_restart） */
 	private send(
-		type: 'hello' | 'state_request' | 'ui_command' | 'mp_input' | 'mp_action',
+		type: 'hello' | 'state_request' | 'ui_command' | 'mp_input' | 'mp_action' | 'admin_restart',
 		payload: unknown,
 	) {
 		const ws = this.ws
@@ -229,6 +237,10 @@ export class PbClient {
 		}
 		if (isType(msg, 'event')) {
 			this.onMpEvent?.(msg.payload)
+			return
+		}
+		if (isType(msg, 'admin_restarting')) {
+			this.onAdminRestarting?.(msg.payload)
 			return
 		}
 		// 其余类型（config_update 等）不属 PF 通道，忽略

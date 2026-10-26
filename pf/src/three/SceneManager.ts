@@ -30,7 +30,7 @@ import type {
 	ZNetState,
 } from '../protocol/messages'
 import { pbClient } from '../ws/client'
-import { PlayerCombat, type CombatHud } from './combat'
+import { PlayerCombat, type CombatHud, type FloatKind } from './combat'
 import { buildDevices, type DeviceRigs } from './devices'
 import { buildRoom, type RoomRig } from './room'
 import { RemotePlayers } from './RemotePlayers'
@@ -42,7 +42,7 @@ export type ViewMode = 'fixed' | 'walk'
 /** 格斗系统对 UI 层的回调（HUD 推送 / 飘字 / 全屏闪光） */
 export interface CombatUiHooks {
 	onHud(hud: CombatHud): void
-	onFloat(text: string, sxPct: number, syPct: number, crit: boolean): void
+	onFloat(text: string, sxPct: number, syPct: number, kind: FloatKind): void
 	onFlash(kind: 'hurt' | 'parry'): void
 }
 
@@ -207,8 +207,9 @@ export class SceneManager {
 		this.combat = new PlayerCombat({
 			onHud: () => this.combatHooks?.onHud(this.combat.getHud(this.zombies, this.camera)),
 			onToast: (t) => this.onToast?.(t),
-			onFloat: (text, sx, sy, crit) => this.combatHooks?.onFloat(text, sx, sy, crit),
+			onFloat: (text, sx, sy, kind) => this.combatHooks?.onFloat(text, sx, sy, kind),
 			onFlash: (k) => this.combatHooks?.onFlash(k),
+			onStabAim: (dir) => this.beginStabAim(dir),
 		})
 		this.combat.attach(this.camera)
 
@@ -420,7 +421,10 @@ export class SceneManager {
 				this.onToast?.(`正在复活 ${corpse.name}`)
 				return
 			}
-			const consumed = this.combat.onLeftClick(this.lastTime, this.zombies, this.remotePlayers.centers(), this.camera)
+			const consumed = this.combat.onLeftClick(
+				this.lastTime, this.zombies, this.remotePlayers.centers(), this.camera,
+				!this.flying && this.camera.position.y <= EYE_HEIGHT + 1e-4,
+			)
 			if (consumed) return
 			const tag = this.pickInteractable()
 			if (tag) {
@@ -723,22 +727,34 @@ export class SceneManager {
 				const z = this.zombies.find((x) => x.id === e.id)
 				if (z) {
 					z.flash()
-					this.combat.pushFloat(z.headPos, `${Math.round(e.amount)}${e.crit ? '!' : ''}`, e.crit)
+					// 飘字按 DamageSign 分型：暴击大字感叹 / 治疗绿色 / 格挡灰字 / 普通白字
+					const amount = Math.round(e.amount)
+					if (e.sign === 2) this.combat.pushFloat(z.headPos, `${amount}!`, 'crit')
+					else if (e.sign === -1) this.combat.pushFloat(z.headPos, `+${amount}`, 'heal')
+					else if (e.sign === 0) this.combat.pushFloat(z.headPos, '格挡', 'blocked')
+					else this.combat.pushFloat(z.headPos, `${amount}`, 'normal')
 				}
 				break
 			}
 			case 'dmg_p': {
+				const amount = Math.round(e.amount)
 				if (e.uuid === me) {
 					playSfx('kick')
 					this.combatHooks?.onFlash('hurt')
 					const pos = this.camera.position.clone()
 					pos.y += 0.3
-					this.combat.pushFloat(pos, `-${Math.round(e.amount)}`, false)
+					if (e.sign === -1) this.combat.pushFloat(pos, `+${amount}`, 'heal')
+					else if (e.sign === 0) this.combat.pushFloat(pos, '格挡', 'blocked')
+					else this.combat.pushFloat(pos, `-${amount}${e.sign === 2 ? '!' : ''}`, e.sign === 2 ? 'crit' : 'normal')
 				} else {
 					this.remotePlayers.flash(e.uuid)
 					this.remotePlayers.bleed(e.uuid)
 					const c = this.remotePlayers.centers().find((c) => c.uuid === e.uuid)
-					if (c) this.combat.pushFloat(new THREE.Vector3(c.x, 2.0, c.z), `-${Math.round(e.amount)}`, false)
+					if (c) {
+						if (e.sign === -1) this.combat.pushFloat(new THREE.Vector3(c.x, 2.0, c.z), `+${amount}`, 'heal')
+						else if (e.sign === 0) this.combat.pushFloat(new THREE.Vector3(c.x, 2.0, c.z), '格挡', 'blocked')
+						else this.combat.pushFloat(new THREE.Vector3(c.x, 2.0, c.z), `-${amount}${e.sign === 2 ? '!' : ''}`, e.sign === 2 ? 'crit' : 'normal')
+					}
 				}
 				break
 			}
@@ -862,15 +878,18 @@ export class SceneManager {
 				}
 			}
 		}
+		this.keys.add(e.code)
 		// 第一人称下 Shift → 朝 WSAD 按住的方向闪避（爆发速度 + dash 音效）
+		// 注：keys.add 必须先于 Shift 分支——同帧先 Shift 后按方向键时方向需已入 keys
 		if ((e.code === 'ShiftLeft' || e.code === 'ShiftRight') && !e.repeat && this.mode === 'walk') {
 			this.tryDash(this.lastTime)
 		}
-		this.keys.add(e.code)
 	}
 
 	/** 闪避：沿当前 WASD 输入方向瞬间赋予爆发速度（需按住方向键，0.6s 冷却） */
 	private lastDash = 0
+	/** 闪避速度豁免截止：期间水平软上限不生效（否则 8.5 m/s 爆发速度被钳回 3.0 等于没闪） */
+	private dashFreeUntil = 0
 	private tryDash(now: number) {
 		if (now - this.lastDash < DASH_CD) return
 		const f = (this.keys.has('KeyW') ? 1 : 0) - (this.keys.has('KeyS') ? 1 : 0)
@@ -885,7 +904,31 @@ export class SceneManager {
 		this.vel.x = dir.x * DASH_SPEED
 		this.vel.z = dir.z * DASH_SPEED
 		this.lastDash = now
+		this.dashFreeUntil = now + 0.25
 		playSfx('dash')
+	}
+
+	// ---------------- 空中戳刺镜头（camera slerp 转向目标） ----------------
+
+	/** 戳刺镜头状态：目标四元数 + 截止时刻（期间压掉 PointerLockControls 鼠标输入） */
+	private stabLerp: { quat: THREE.Quaternion; until: number } | null = null
+
+	private beginStabAim(dir: THREE.Vector3) {
+		const m = new THREE.Matrix4().lookAt(new THREE.Vector3(), dir, new THREE.Vector3(0, 1, 0))
+		this.stabLerp = { quat: new THREE.Quaternion().setFromRotationMatrix(m), until: this.lastTime + 0.4 }
+	}
+
+	/** 每帧推进戳刺镜头；结束（超时或落地）恢复 pointerSpeed=1 */
+	private updateStabLerp(dt: number) {
+		if (!this.stabLerp) return
+		const grounded = this.camera.position.y <= EYE_HEIGHT + 1e-4
+		if (this.lastTime >= this.stabLerp.until || grounded) {
+			this.stabLerp = null
+			this.lockCtl.pointerSpeed = 1
+			return
+		}
+		this.lockCtl.pointerSpeed = 0
+		this.camera.quaternion.slerp(this.stabLerp.quat, Math.min(1, dt * 10))
 	}
 
 	private handleKeyUp = (e: KeyboardEvent) => {
@@ -949,9 +992,9 @@ export class SceneManager {
 		const damp = Math.exp(-(hasInput ? FRICTION_MOVE : FRICTION_IDLE) * dt)
 		this.vel.x *= damp
 		this.vel.z *= damp
-		// 水平速度软上限（疾跑上限更高）
+		// 水平速度软上限（疾跑上限更高；闪避爆发速度 0.25s 内豁免）
 		const hSpeed = Math.hypot(this.vel.x, this.vel.z)
-		if (hSpeed > maxSpeed) {
+		if (hSpeed > maxSpeed && this.lastTime > this.dashFreeUntil) {
 			const k = maxSpeed / hSpeed
 			this.vel.x *= k
 			this.vel.z *= k
@@ -1057,6 +1100,7 @@ export class SceneManager {
 
 		if (this.mode === 'walk') {
 			this.updateWalk(dt)
+			this.updateStabLerp(dt)
 			// 格斗系统（本地剑动画 + 意图上报；伤害 / 眩晕 / 追击窗口由 PB 快照驱动）
 			const active = this.lockCtl.isLocked
 			this.combat.update(dt, time, this.camera, active)
@@ -1066,6 +1110,11 @@ export class SceneManager {
 				this.sendMpInput()
 			}
 		} else {
+			// 切出第一人称：中止戳刺镜头并恢复鼠标灵敏度
+			if (this.stabLerp) {
+				this.stabLerp = null
+				this.lockCtl.pointerSpeed = 1
+			}
 			this.orbit.update()
 		}
 

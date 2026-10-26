@@ -119,6 +119,9 @@ export function checkSwitchNarrowing(msg: ToPf): number {
 		case 'event': {
 			return 0
 		}
+		case 'admin_restarting': {
+			return 0
+		}
 	}
 }
 

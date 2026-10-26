@@ -68,7 +68,7 @@ interface FloatText {
   text: string
   sx: number
   sy: number
-  crit: boolean
+  kind: 'normal' | 'crit' | 'heal' | 'blocked'
 }
 const floats = ref<FloatText[]>([])
 let floatId = 0
@@ -84,9 +84,9 @@ onMounted(() => {
     (l) => (locked.value = l),
     {
       onHud: (h) => (hud.value = h),
-      onFloat: (text, sx, sy, crit) => {
+      onFloat: (text, sx, sy, kind) => {
         const id = ++floatId
-        floats.value.push({ id, text, sx, sy, crit })
+        floats.value.push({ id, text, sx, sy, kind })
         window.setTimeout(() => {
           floats.value = floats.value.filter((f) => f.id !== id)
         }, 900)
@@ -192,7 +192,7 @@ onBeforeUnmount(() => {
     </div>
     <!-- 伤害 / 飘字 -->
     <div class="floats">
-      <div v-for="f in floats" :key="f.id" class="float" :class="{ crit: f.crit }" :style="{ left: f.sx + '%', top: f.sy + '%' }">{{ f.text }}</div>
+      <div v-for="f in floats" :key="f.id" class="float" :class="f.kind" :style="{ left: f.sx + '%', top: f.sy + '%' }">{{ f.text }}</div>
     </div>
     <!-- 全屏闪光：受击红 / 完美格挡金 -->
     <div class="flash hurt" :class="{ on: hurtFlash }"></div>
@@ -487,6 +487,13 @@ onBeforeUnmount(() => {
 .float.crit {
   color: #ffd76a;
   font-size: 20px;
+}
+.float.heal {
+  color: #52e07c;
+}
+.float.blocked {
+  color: #9aa7b5;
+  font-size: 13px;
 }
 @keyframes floatUp {
   0% { opacity: 0; margin-top: 0; }
