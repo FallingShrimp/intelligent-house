@@ -155,7 +155,7 @@ export interface MpActionPayload {
   segment?: number
   /** wave 专用：蓄力时长 s（PB 按每秒 10 体力结算消耗） */
   hold?: number
-  /** pick 专用：所选增益索引（0–6，必须是 PB 分到自己抽中的 3 项之一） */
+  /** pick 专用：所选增益索引（0–15，必须是 PB 分到自己抽中的 3 项之一） */
   idx?: number
   /** revive 专用：要复活的队友（尸体）uuid */
   target?: string
@@ -184,6 +184,8 @@ export interface NetPlayerState {
   impact: number; stability: number;
   /** 暴击率（0~1）/ 暴击伤害加成（暴击伤害 = 基础 × (1 + crit_dmg)） */
   crit_rate: number; crit_dmg: number;
+  /** 化气（完美格挡回复比例：回复血量 = 格挡伤害 × huaqi） */
+  huaqi: number;
   /** 三选一状态（进行中非空）：抽到的 3 个增益索引 + 是否已选 */
   pick: { options: number[]; done: boolean } | null;
 }

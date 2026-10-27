@@ -102,18 +102,19 @@ interface Wave {
 type StatKey =
 	| 'atk' | 'maxHp' | 'maxSt' | 'parryPct' | 'blockMaxS' | 'dmgMul'
 	| 'chargeSpd' | 'chargeMax' | 'thorn' | 'lifesteal' | 'multiWave'
-	| 'impact' | 'stability' | 'critRate' | 'critDmg'
+	| 'impact' | 'stability' | 'critRate' | 'critDmg' | 'huaqi'
 
 /** 词条初始值（与三选一档位一一对应，见 World.PICK_OPTIONS） */
 const STAT_DEFAULTS: Record<StatKey, number> = {
 	atk: 10, maxHp: P_MAX_HP, maxSt: P_MAX_ST, parryPct: 0.5, blockMaxS: 1.0,
 	dmgMul: 1, chargeSpd: 1, chargeMax: 1.0, thorn: 0, lifesteal: 0,
 	multiWave: 0, impact: 1, stability: 1, critRate: 0.05, critDmg: 1.0,
+	huaqi: 0.3,
 }
 
 /** 百分比词条：加值后 ×100 取整防浮漂 */
 const PCT_STAT_KEYS: ReadonlySet<StatKey> = new Set([
-	'parryPct', 'dmgMul', 'chargeSpd', 'thorn', 'impact', 'stability', 'critRate', 'critDmg',
+	'parryPct', 'dmgMul', 'chargeSpd', 'thorn', 'impact', 'stability', 'critRate', 'critDmg', 'huaqi',
 ])
 
 /** 三选一增益选项（表驱动） */
@@ -609,6 +610,7 @@ export class World {
 		{ label: '稳定性 +15%', key: 'stability', add: 0.15 },
 		{ label: '暴击率 +5%', key: 'critRate', add: 0.05 },
 		{ label: '暴击伤害 +25%', key: 'critDmg', add: 0.25 },
+		{ label: '化气 +10%', key: 'huaqi', add: 0.1 },
 	]
 
 	/** 僵尸被击败：房间内所有第一人称玩家进入三选一（每人独立随机抽 3 项） */
@@ -708,8 +710,7 @@ export class World {
 					by.guardBreakUntil = now + 0.5
 					this.events.push({ kind: 'guardbreak', uuid: by.uuid, dur: 0.5 })
 				}
-				// 完美格挡剑气：格挡者恢复 30 血量（上限 100）
-				if (isWave) v.hp = Math.min(v.stats.maxHp, v.hp + 30)
+				this.perfectParryHeal(v, dmg)
 				this.events.push({ kind: 'parry', uuid: v.uuid, perfect: true, fail: false, drain: 20, byZombie: fromZombie })
 				this.registerBlock(v, now)
 				return
@@ -742,6 +743,7 @@ export class World {
 				z.stamina = Math.max(0, z.stamina - 20)
 				const drained = z.stamina <= 0
 				if (z.state === 'recover') z.recExtra += 0.5 // 踉跄：延长后摇
+				this.perfectParryHeal(v, dmg)
 				this.events.push({ kind: 'parry', uuid: v.uuid, perfect: true, fail: false, drain: 20, byZombie: true })
 				if (drained) this.zombieStun(z, now)
 				this.registerBlock(v, now)
@@ -758,6 +760,14 @@ export class World {
 			return
 		}
 		this.hurtPlayer(v, dmg, now, null)
+	}
+
+	/** 化气：完美格挡回复「格挡伤害 × 化气」（封顶 maxHp；dmg_p sign=Heal 供 PF 绿色飘字，满血不飘） */
+	private perfectParryHeal(v: MpPlayer, dmg: DamageSource): void {
+		const healed = Math.min(v.stats.maxHp - v.hp, Math.round(dmg.amount * v.stats.huaqi * 100) / 100)
+		if (healed <= 0) return
+		v.hp += healed
+		this.events.push({ kind: 'dmg_p', uuid: v.uuid, amount: healed, sign: DamageSign.Heal, by: 'sys', interrupt: false })
 	}
 
 	/** 玩家掉血落地结算：荆棘反伤 / 吸血回复 / 死亡清理 */
@@ -1206,6 +1216,7 @@ export class World {
 				thorn_pct: p.stats.thorn, lifesteal: p.stats.lifesteal, multi_wave: p.stats.multiWave,
 				impact: p.stats.impact, stability: p.stats.stability,
 				crit_rate: p.stats.critRate, crit_dmg: p.stats.critDmg,
+				huaqi: round2(p.stats.huaqi),
 				pick: p.pick ? { options: p.pick.options, done: p.pick.choice !== null } : null,
 			})),
 			zombies: this.zombies.map((z) => ({

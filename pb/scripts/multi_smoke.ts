@@ -5,15 +5,17 @@
  * 1. 双 PF 客户端 hello（带 display_name）→ 各自分配 uuid + 不同随机颜色
  * 2. 世界快照：fp 玩家互见（10Hz 广播），free 玩家不在房间
  * 3. 房间内玩家点击台灯（mp_action lamp）→ PB 生成共享僵尸
- * 4. 玩家攻击僵尸 → dmg_z 事件（三段连击 90% = 9 伤害）
+ * 4. 玩家攻击僵尸 → dmg_z 事件（三段连击 90% = 9 伤害；开局关闭 A 暴击保证基线）
  * 5. 友伤：攻击其他玩家 → dmg_p 事件
  * 6. 完美格挡：对方 parry_start 后立即受击 → parry(perfect) + 攻击者 guardbreak
- * 7. 断开连接 → leave 事件 + 快照移除玩家
- * 8. 重击剑气蓄力：hold=0.5 → 伤害 15×dmgMul；hold=2 钳到蓄力上限 1.0 → 30×dmgMul
- * 9. 暴击：critRate=1 连击全部 sign=2（伤害 ×(1+critDmg)）；critRate=0 恢复 sign=1
- * 10. 冲击力：玩家 impact=1.5 → 僵尸落手扣体 10×1.5=15
+ * 7. 化气：完美格挡回复 格挡伤害×化气（9×30%=2.7，dmg_p sign=-1）
+ * 8. 退出第一人称（mode=free）→ 快照 fp=false（退出房间）
+ * 9. 断开连接 → leave 事件 + 快照移除玩家
+ * 10. 重击剑气蓄力：hold=0.5 → 伤害 15×dmgMul；hold=2 钳到蓄力上限 1.0 → 30×dmgMul
+ * 11. 暴击：critRate=1 连击全部 sign=2（伤害 ×(1+critDmg)）；critRate=0 恢复 sign=1
+ * 12. 冲击力：玩家 impact=1.5 → 僵尸落手扣体 10×1.5=15
  *
- * 用例 8-10 通过同进程导出的 world 单例做确定性铺垫（关暴击 / 摆僵尸位 / 设词条），
+ * 用例 10-12 通过同进程导出的 world 单例做确定性铺垫（关暴击 / 摆僵尸位 / 设词条），
  * 战斗结算本身仍走完整协议链路（mp_input / mp_action → PB 裁决 → 事件广播）。
  */
 import { app, logger, startWorldLoop, world } from '../src/index'
@@ -243,6 +245,8 @@ async function main(): Promise<void> {
 
   ok =
     (await step('玩家 A 攻击僵尸 → dmg_z 事件（三段连击 90% = 9 伤害）', async () => {
+      // 关闭 A 暴击（默认 5% 会偶发 ×2 污染基线断言；暴击机制由后置专用用例验证）
+      world.players.get(uuidA)!.stats.critRate = 0
       // 等僵尸 chase 靠近 A 至攻击距离内（REACH 3.0）
       await waitWorld(a, (w) => {
         const z = w.zombies.find((x: AnyMsg) => x.id === zombieId)
@@ -288,6 +292,28 @@ async function main(): Promise<void> {
         const pb = w.players.find((p: AnyMsg) => p.uuid === uuidB)
         return pb && pb.hp === 100
       }, 'B 满血（格挡成功）')
+    })) && ok
+
+  ok =
+    (await step('化气：完美格挡回复 格挡伤害×化气（9×30%=2.7，dmg_p sign=-1 绿色飘字）', async () => {
+      const pbp = world.players.get(uuidB)!
+      const z = world.zombies[0]
+      // 僵尸暂移远处，避免其攻击污染血量断言（后续剑气用例会重新摆位）
+      z.x = 20; z.z = 1.9
+      pbp.hp = 50 // 先掉血，回复量才可见
+      // B 仍在格挡态但 blockStart 已过期 → parry_stop + 冷却 0.5s 后重新 parry_start
+      send(b, 'mp_action', nextSeq(), { kind: 'parry_stop' })
+      await sleep(600)
+      send(b, 'mp_action', nextSeq(), { kind: 'parry_start' })
+      await sleep(40) // parry_start 先落地（窗口 0.5s 内受击 → 完美格挡）
+      send(a, 'mp_action', nextSeq(), { kind: 'attack', segment: 0 }) // 10×0.9=9
+      const parry = await recvWhere(b, (m) => m.type === 'event' && m.payload.kind === 'parry' && m.payload.uuid === uuidB && m.payload.perfect === true, 'B 完美格挡')
+      assert(parry.payload.byZombie === false, 'PVP 完美格挡')
+      // 化气回复事件：dmg_p sign=-1（Heal）amount=2.7
+      // （步骤 6 的完美格挡也会产生 4.5 的回复事件留在收件箱 → 必须按金额过滤旧事件）
+      const heal = await recvWhere(b, (m) => m.type === 'event' && m.payload.kind === 'dmg_p' && m.payload.uuid === uuidB && m.payload.sign === -1 && m.payload.amount === 2.7, '化气治疗 dmg_p')
+      assert(heal.payload.amount === 2.7, `回复 = 9×0.3=2.7（实际 ${heal.payload.amount}）`)
+      assert(Math.abs(pbp.hp - 52.7) < 1e-6, `B 血量 50 → 52.7（实际 ${pbp.hp}）`)
     })) && ok
 
   ok =
