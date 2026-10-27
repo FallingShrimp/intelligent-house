@@ -152,6 +152,7 @@ export interface MpInputPayload {
 /** PF → PB 动作意图 */
 export interface MpActionPayload {
   kind: 'attack' | 'parry_start' | 'parry_stop' | 'respawn' | 'wave' | 'pick' | 'revive' | 'lamp'
+  /** attack 专用：0-2 三段连击 / 3 空中戳刺（PB：伤害同首段，冲击力 25；普攻/反击/追击 3，重击剑气 11） */
   segment?: number
   /** wave 专用：蓄力时长 s（PB 按每秒 10 体力结算消耗） */
   hold?: number
@@ -186,6 +187,8 @@ export interface NetPlayerState {
   crit_rate: number; crit_dmg: number;
   /** 化气（完美格挡回复比例：回复血量 = 格挡伤害 × huaqi） */
   huaqi: number;
+  /** 防御（受伤减免：最终伤害 = 原始 × 500 / (490 + def)，初始 10 → ×1 基准） */
+  def: number;
   /** 三选一状态（进行中非空）：抽到的 3 个增益索引 + 是否已选 */
   pick: { options: number[]; done: boolean } | null;
 }

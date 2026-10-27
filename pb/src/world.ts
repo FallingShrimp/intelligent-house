@@ -102,14 +102,14 @@ interface Wave {
 type StatKey =
 	| 'atk' | 'maxHp' | 'maxSt' | 'parryPct' | 'blockMaxS' | 'dmgMul'
 	| 'chargeSpd' | 'chargeMax' | 'thorn' | 'lifesteal' | 'multiWave'
-	| 'impact' | 'stability' | 'critRate' | 'critDmg' | 'huaqi'
+	| 'impact' | 'stability' | 'critRate' | 'critDmg' | 'huaqi' | 'def'
 
 /** 词条初始值（与三选一档位一一对应，见 World.PICK_OPTIONS） */
 const STAT_DEFAULTS: Record<StatKey, number> = {
 	atk: 10, maxHp: P_MAX_HP, maxSt: P_MAX_ST, parryPct: 0.5, blockMaxS: 1.0,
 	dmgMul: 1, chargeSpd: 1, chargeMax: 1.0, thorn: 0, lifesteal: 0,
 	multiWave: 0, impact: 1, stability: 1, critRate: 0.05, critDmg: 1.0,
-	huaqi: 0.3,
+	huaqi: 0.3, def: 10,
 }
 
 /** 百分比词条：加值后 ×100 取整防浮漂 */
@@ -470,7 +470,7 @@ export class World {
 					from: `p:${by.uuid}`,
 					amount: crit ? w.dmg * (1 + by.stats.critDmg) : w.dmg,
 					sign: crit ? DamageSign.Crit : DamageSign.Normal,
-					impact: 10,
+					impact: 11,
 				}
 				if (t.z) this.damageZombie(t.z, waveDmg, by, now)
 				else if (t.p) this.damagePlayer(t.p, waveDmg, by, now, false, true)
@@ -507,19 +507,20 @@ export class World {
 			return
 		}
 		const segMul = COMBO_MUL[((segment % 3) + 3) % 3]
-		const dmg = this.playerHit(p, p.stats.atk * segMul * p.stats.dmgMul)
+		// segment 3 = 空中戳刺（伤害同首段，冲击力 25）；其余普攻段冲击力 3
+		const dmg = this.playerHit(p, p.stats.atk * segMul * p.stats.dmgMul, segment === 3 ? 25 : 3)
 		if (tgt.zombie) this.damageZombie(tgt.zombie, dmg, p, now)
 		else this.damagePlayer(tgt.player!, dmg, p, now, false)
 	}
 
-	/** 玩家攻击构造 DamageSource：掷暴击（命中 critRate → 伤害 ×(1+critDmg)） */
-	private playerHit(p: MpPlayer, amount: number): DamageSource {
+	/** 玩家攻击构造 DamageSource：掷暴击（命中 critRate → 伤害 ×(1+critDmg)）；impact 默认 3（普攻/反击/追击同值） */
+	private playerHit(p: MpPlayer, amount: number, impact = 3): DamageSource {
 		const crit = Math.random() < p.stats.critRate
 		return {
 			from: `p:${p.uuid}`,
 			amount: crit ? amount * (1 + p.stats.critDmg) : amount,
 			sign: crit ? DamageSign.Crit : DamageSign.Normal,
-			impact: 10,
+			impact,
 		}
 	}
 
@@ -611,6 +612,7 @@ export class World {
 		{ label: '暴击率 +5%', key: 'critRate', add: 0.05 },
 		{ label: '暴击伤害 +25%', key: 'critDmg', add: 0.25 },
 		{ label: '化气 +10%', key: 'huaqi', add: 0.1 },
+		{ label: '防御 +30', key: 'def', add: 30 },
 	]
 
 	/** 僵尸被击败：房间内所有第一人称玩家进入三选一（每人独立随机抽 3 项） */
@@ -721,8 +723,8 @@ export class World {
 				this.hurtPlayer(v, dmg, now, by)
 				return
 			}
-			this.useStamina(v, dmg.impact, now, by)
-			this.events.push({ kind: 'parry', uuid: v.uuid, perfect: false, fail: false, drain: 10, byZombie: fromZombie })
+			const drained = this.useStamina(v, dmg.impact, now, by)
+			this.events.push({ kind: 'parry', uuid: v.uuid, perfect: false, fail: false, drain: Math.round(drained * 100) / 100, byZombie: fromZombie })
 			this.registerBlock(v, now)
 			return
 		}
@@ -770,8 +772,10 @@ export class World {
 		this.events.push({ kind: 'dmg_p', uuid: v.uuid, amount: healed, sign: DamageSign.Heal, by: 'sys', interrupt: false })
 	}
 
-	/** 玩家掉血落地结算：荆棘反伤 / 吸血回复 / 死亡清理 */
+	/** 玩家掉血落地结算：防御缩放 / 荆棘反伤 / 吸血回复 / 死亡清理 */
 	private hurtPlayer(v: MpPlayer, dmg: DamageSource, now: number, byPlayer: MpPlayer | null, byZombie: MpZombie | null = null): void {
+		// 防御：最终伤害 = 原始 × 500 / (490 + def)（初始 10 → ×1 基准；低于放大 / 高于减免）
+		dmg.amount = Math.round(((dmg.amount * 500) / (490 + v.stats.def)) * 100) / 100
 		v.hp = Math.max(0, v.hp - dmg.amount)
 		this.events.push({ kind: 'dmg_p', uuid: v.uuid, amount: dmg.amount, sign: dmg.sign, by: byPlayer?.uuid ?? dmg.from, interrupt: false })
 		// 荆棘：伤害发出者受到「伤害 × 荆棘」等量反伤（直伤，不触发对方格挡 / 再反伤）
@@ -828,7 +832,7 @@ export class World {
 	}
 
 	/** 扣体力：扣除量 = 基值 × 攻击者冲击力 / 受击者稳定性（僵尸无词条恒 1；无攻击者冲击力按 100%） */
-	private useStamina(p: MpPlayer, n: number, now: number, attacker?: MpPlayer | MpZombie | null): void {
+	private useStamina(p: MpPlayer, n: number, now: number, attacker?: MpPlayer | MpZombie | null): number {
 		const ai = attacker && 'stats' in attacker ? attacker.stats.impact : 1
 		const cost = (n * ai) / p.stats.stability
 		p.stamina = Math.max(0, p.stamina - cost)
@@ -838,6 +842,7 @@ export class World {
 			p.exhaustUntil = p.stunUntil // 体力耗尽眩晕：结束后体力回满（tick 结算）
 			p.blocking = false
 		}
+		return cost
 	}
 
 	/** 记录成功格挡（8s 内 2 次 → 为攻击来源僵尸预约横扫） */
@@ -1217,6 +1222,7 @@ export class World {
 				impact: p.stats.impact, stability: p.stats.stability,
 				crit_rate: p.stats.critRate, crit_dmg: p.stats.critDmg,
 				huaqi: round2(p.stats.huaqi),
+				def: p.stats.def,
 				pick: p.pick ? { options: p.pick.options, done: p.pick.choice !== null } : null,
 			})),
 			zombies: this.zombies.map((z) => ({

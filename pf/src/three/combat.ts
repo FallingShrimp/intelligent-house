@@ -280,7 +280,8 @@ export class PlayerCombat {
 			const stab = this.findStabTarget(zombies, remotes, camera)
 			if (stab) {
 				this.startSwing(SWING_THRUST, now)
-				pbClient.sendMpAction({ kind: 'attack', segment: 0 })
+				// segment 3 = 空中戳刺标识（PB：伤害同首段，冲击力 25）
+				pbClient.sendMpAction({ kind: 'attack', segment: 3 })
 				this.stabPitch = Math.asin(THREE.MathUtils.clamp(stab.dir.y, -1, 1))
 				this.hooks.onStabAim(stab.dir)
 				return true

@@ -9,13 +9,14 @@
  * 5. 友伤：攻击其他玩家 → dmg_p 事件
  * 6. 完美格挡：对方 parry_start 后立即受击 → parry(perfect) + 攻击者 guardbreak
  * 7. 化气：完美格挡回复 格挡伤害×化气（9×30%=2.7，dmg_p sign=-1）
- * 8. 退出第一人称（mode=free）→ 快照 fp=false（退出房间）
- * 9. 断开连接 → leave 事件 + 快照移除玩家
- * 10. 重击剑气蓄力：hold=0.5 → 伤害 15×dmgMul；hold=2 钳到蓄力上限 1.0 → 30×dmgMul
- * 11. 暴击：critRate=1 连击全部 sign=2（伤害 ×(1+critDmg)）；critRate=0 恢复 sign=1
- * 12. 冲击力：玩家 impact=1.5 → 僵尸落手扣体 10×1.5=15
+ * 8. 普通格挡（非完美窗口）：无伤扣体 = 普攻冲击力 3（parry.drain 随攻击类型动态）
+ * 9. 退出第一人称（mode=free）→ 快照 fp=false（退出房间）
+ * 10. 断开连接 → leave 事件 + 快照移除玩家
+ * 11. 重击剑气蓄力：hold=0.5 → 伤害 15×dmgMul；hold=2 钳到蓄力上限 1.0 → 30×dmgMul
+ * 12. 暴击：critRate=1 连击全部 sign=2（伤害 ×(1+critDmg)）；critRate=0 恢复 sign=1
+ * 13. 冲击力：玩家 impact=1.5 → 僵尸落手扣体 10×1.5=15
  *
- * 用例 10-12 通过同进程导出的 world 单例做确定性铺垫（关暴击 / 摆僵尸位 / 设词条），
+ * 用例 11-13 通过同进程导出的 world 单例做确定性铺垫（关暴击 / 摆僵尸位 / 设词条），
  * 战斗结算本身仍走完整协议链路（mp_input / mp_action → PB 裁决 → 事件广播）。
  */
 import { app, logger, startWorldLoop, world } from '../src/index'
@@ -263,15 +264,18 @@ async function main(): Promise<void> {
     })) && ok
 
   ok =
-    (await step('友伤：A 攻击面前的 B → dmg_p 事件', async () => {
+    (await step('友伤：A 攻击面前的 B → dmg_p 事件（顺带验证防御词条：def=110 → 9×500/600=7.5）', async () => {
       await sleep(400) // 服务端攻击最小间隔 0.3s
       // B 站到 A 前方 0.6m；A 转向 +x
       input(b, [-2.4, 1.6, 1.9], [-1, 0], 'fp')
       input(a, [-3.0, 1.6, 1.9], [1, 0], 'fp')
       await sleep(150) // 输入到达 PB
+      const pbp = world.players.get(uuidB)!
+      pbp.stats.def = 110 // 防御缩放：9 × 500/(490+110) = 7.5
       send(a, 'mp_action', nextSeq(), { kind: 'attack', segment: 1 })
       const dmg = await recvWhere(a, (m) => m.type === 'event' && m.payload.kind === 'dmg_p' && m.payload.uuid === uuidB, 'dmg_p(B)')
-      assert(dmg.payload.amount === 9, `友伤 9（实际 ${dmg.payload.amount}）`)
+      assert(dmg.payload.amount === 7.5, `友伤 9×500/(490+110)=7.5（实际 ${dmg.payload.amount}）`)
+      pbp.stats.def = 10 // 恢复基准，避免污染后续用例
       assert(dmg.payload.by === uuidA, '友伤来源 A')
     })) && ok
 
@@ -314,6 +318,26 @@ async function main(): Promise<void> {
       const heal = await recvWhere(b, (m) => m.type === 'event' && m.payload.kind === 'dmg_p' && m.payload.uuid === uuidB && m.payload.sign === -1 && m.payload.amount === 2.7, '化气治疗 dmg_p')
       assert(heal.payload.amount === 2.7, `回复 = 9×0.3=2.7（实际 ${heal.payload.amount}）`)
       assert(Math.abs(pbp.hp - 52.7) < 1e-6, `B 血量 50 → 52.7（实际 ${pbp.hp}）`)
+    })) && ok
+
+  ok =
+    (await step('普通格挡（非完美窗口）：无伤扣体 = 普攻冲击力 3（parry.drain 随攻击类型动态）', async () => {
+      send(b, 'mp_action', nextSeq(), { kind: 'parry_stop' })
+      await sleep(600) // 格挡起手冷却
+      for (let i = 0; i < 5; i++) {
+        send(b, 'mp_action', nextSeq(), { kind: 'parry_start' })
+        await sleep(600) // 越过 0.5s 完美窗口（blockMaxS×parryPct），仍在 1.0s 格挡持续内
+        send(a, 'mp_action', nextSeq(), { kind: 'attack', segment: 0 })
+        const parry = await recvWhere(a, (m) => m.type === 'event' && m.payload.kind === 'parry' && m.payload.uuid === uuidB, 'parry 事件')
+        send(b, 'mp_action', nextSeq(), { kind: 'parry_stop' })
+        if (parry.payload.fail || parry.payload.perfect) {
+          await sleep(600) // 25% 格挡失败 / 网络抖动误入完美窗口 → 重试
+          continue
+        }
+        assert(parry.payload.drain === 3, `普通格挡扣体 = 普攻冲击力 3（实际 ${parry.payload.drain}）`)
+        return
+      }
+      assert(false, '5 次重试内未获得普通格挡事件')
     })) && ok
 
   ok =

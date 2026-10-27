@@ -2,7 +2,7 @@
 /**
  * 击杀三选一增益弹窗：僵尸被击败后房间内所有玩家三选一，
  * 全员选完前 PB 冻结世界（pick_phase）。已选 / 无选项时显示等待横幅。
- * options 为 PB 抽中的增益索引（0–15，文案与 PB world.ts PICK_OPTIONS 对齐）。
+ * options 为 PB 抽中的增益索引（0–16，文案与 PB world.ts PICK_OPTIONS 对齐）。
  */
 defineProps<{ options: number[] | null; done: boolean }>()
 const emit = defineEmits<{ choose: [idx: number] }>()
@@ -24,6 +24,7 @@ const LABELS = [
 	'暴击率 +5%',
 	'暴击伤害 +25%',
 	'化气 +10%',
+	'防御 +30',
 ]
 </script>
 

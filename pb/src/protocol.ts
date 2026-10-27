@@ -237,11 +237,11 @@ export type MpInputPayload = z.infer<typeof MpInputPayloadSchema>
 export const MpActionPayloadSchema = z
 	.object({
 		kind: z.enum(['attack', 'parry_start', 'parry_stop', 'respawn', 'wave', 'pick', 'revive', 'lamp']),
-		segment: z.number().int().min(0).max(2).optional(),
+		segment: z.number().int().min(0).max(3).optional(),
 		/** wave 专用：蓄力时长 s（PB 按每秒 10 体力结算消耗） */
 		hold: z.number().min(0).max(10).optional(),
 		/** pick 专用：选择的增益索引（0-15，必须是 PF 分到的 3 项之一） */
-		idx: z.number().int().min(0).max(15).optional(),
+		idx: z.number().int().min(0).max(16).optional(),
 		/** revive 专用：要复活的玩家 uuid */
 		target: z.string().min(1).optional(),
 	})
