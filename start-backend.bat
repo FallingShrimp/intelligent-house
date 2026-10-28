@@ -38,4 +38,3 @@ echo 前端请另运行 start-frontend.bat（预览模式，可局域网访问�
 echo          或 start-frontend-dev.bat（开发模式，仅本机）
 echo 关闭：逐个关闭弹出的命令行窗口（或窗口内 Ctrl+C）
 echo.
-pause

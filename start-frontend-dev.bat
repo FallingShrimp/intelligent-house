@@ -36,4 +36,3 @@ echo 前端地址：http://localhost:5173（vite dev 仅本机可访问）
 echo 注意：请先运行 start-backend.bat 启动 PB/SCB，否则页面显示未连接
 echo 注意：外部设备访问请改用 start-frontend.bat（预览模式）
 echo.
-pause

@@ -16,8 +16,11 @@
 
 // ---------------- 常量（与 PF 单机版对齐） ----------------
 
-const Z_MAX_HP = 300
+const Z_MAX_HP = 500
 const Z_MAX_ST = 100
+/** 补员僵尸世代递进：每代血量上限 +40 / 伤害 +1（僵尸死亡后自动在门处召唤） */
+const Z_TIER_HP = 40
+const Z_TIER_DMG = 1
 const Z_CHASE_SPEED = 0.95
 const Z_ENTER_SPEED = 1.0
 const Z_ATTACK_RANGE = 1.7
@@ -184,7 +187,11 @@ export interface MpZombie {
 	x: number; y: number; z: number
 	yaw: number
 	hp: number
+	/** 血量上限（补员世代递增：Z_MAX_HP + 40×世代），快照 max_hp 供 PF 血条比例 */
+	maxHp: number
 	stamina: number
+	/** 伤害加成（补员世代：strike/sweep/lunge 基础伤害 + 此值） */
+	dmgBonus: number
 	state: ZState
 	stT: number          // 当前状态已持续秒数
 	windupDur: number    // 前摇总时长（windup/sweep/lungeWind/roar）
@@ -261,6 +268,8 @@ export class World {
 	private events: MpEvent[] = []
 	private byWs = new Map<string, string>() // wsId → uuid
 	private zSeq = 0
+	/** 补员世代：每只僵尸死亡 +1（决定补员僵尸的血量/伤害递进） */
+	private zTier = 0
 
 	// ---------------- 玩家生命周期 ----------------
 
@@ -588,6 +597,9 @@ export class World {
 			z.deadAt = this.now()
 			by.kills++
 			this.events.push({ kind: 'zdie', id: z.id })
+			// 门处自动补员更强僵尸：世代 +1（血量上限 +40 / 伤害 +1）
+			this.zTier++
+			this.spawnZombie(Z_TIER_HP * this.zTier, Z_TIER_DMG * this.zTier)
 			this.startPickPhase()
 		}
 	}
@@ -868,11 +880,17 @@ export class World {
 	private maybeSpawnZombie(): void {
 		const alive = this.zombies.filter((z) => z.state !== 'dead').length
 		if (alive >= MAX_ZOMBIES) return
+		this.spawnZombie(0, 0)
+	}
+
+	/** 生成僵尸（门外出生点，enter 走进门内）：hpBonus/dmgBonus 由补员世代决定 */
+	private spawnZombie(hpBonus: number, dmgBonus: number): void {
 		this.zombies.push({
 			id: ++this.zSeq,
 			x: ZOMBIE_SPAWN.x, y: 0, z: ZOMBIE_SPAWN.z,
 			yaw: Math.PI / 2,
-			hp: Z_MAX_HP, stamina: Z_MAX_ST,
+			hp: Z_MAX_HP + hpBonus, maxHp: Z_MAX_HP + hpBonus, stamina: Z_MAX_ST,
+			dmgBonus,
 			state: 'enter', stT: 0, windupDur: Z_WINDUP_S,
 			vulnMul: 0, stunStart: 0, deadAt: 0, target: false,
 			requestSweep: false,
@@ -982,7 +1000,7 @@ export class World {
 					// 落手：对当前最近玩家结算
 					const v = this.nearestPlayer(z)
 					if (v && Math.hypot(v.x - z.x, v.z - z.z) <= Z_STRIKE_RANGE && Math.abs(v.y - 1.0) < 2.2) {
-						this.damagePlayerByZombie(z, v, { from: `z:${z.id}`, amount: 10, sign: DamageSign.Normal, impact: 10 }, now)
+						this.damagePlayerByZombie(z, v, { from: `z:${z.id}`, amount: 10 + z.dmgBonus, sign: DamageSign.Normal, impact: 10 }, now)
 					}
 					if (!this.spendZ(z, Z_ATTACK_COST, now, p)) {
 						z.state = 'recover'; z.stT = 0; z.recExtra = 0
@@ -1005,7 +1023,7 @@ export class World {
 						while (va > Math.PI) va = Math.abs(va - Math.PI * 2)
 						if (va <= Math.PI / 2 + 0.15 && vd <= SWEEP_RANGE && v.y - 1.0 < 1.8) {
 							const wasBlocking = v.blocking
-							this.hurtPlayer(v, { from: `z:${z.id}`, amount: 12, sign: DamageSign.Normal, impact: 0 }, now, null)
+							this.hurtPlayer(v, { from: `z:${z.id}`, amount: 12 + z.dmgBonus, sign: DamageSign.Normal, impact: 0 }, now, null)
 							if (wasBlocking) {
 								v.blocking = false
 								v.guardBreakUntil = now + GUARD_BREAK_S
@@ -1050,7 +1068,7 @@ export class World {
 						z.lungeHits.add(v.uuid)
 						hit = true
 						const vd = Math.hypot(v.x - z.x, v.z - z.z) || 1
-						this.hurtPlayer(v, { from: `z:${z.id}`, amount: 14, sign: DamageSign.Normal, impact: 0 }, now, null)
+						this.hurtPlayer(v, { from: `z:${z.id}`, amount: 14 + z.dmgBonus, sign: DamageSign.Normal, impact: 0 }, now, null)
 						this.events.push({ kind: 'knockback', uuid: v.uuid, dx: (v.x - z.x) / vd, dz: (v.z - z.z) / vd, speed: 6.5 })
 						if (v.blocking) {
 							v.blocking = false
@@ -1230,6 +1248,7 @@ export class World {
 				p: [round2(z.x), round2(z.y), round2(z.z)],
 				yaw: round2(z.yaw),
 				hp: Math.round(z.hp), st: Math.round(z.stamina),
+				max_hp: Math.round(z.maxHp),
 				state: z.state, st_t: round2(z.stT), windup_dur: z.windupDur,
 				vuln: z.vulnMul,
 				target: z.target,

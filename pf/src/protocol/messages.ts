@@ -197,6 +197,8 @@ export interface NetZombieState {
   id: number;
   p: [number, number, number]; yaw: number;
   hp: number; st: number;
+  /** 血量上限（补员僵尸世代递增：500 + 40×世代），血条比例分母 */
+  max_hp: number;
   state: ZNetState; st_t: number; windup_dur: number;
   vuln: number;
   target: boolean;

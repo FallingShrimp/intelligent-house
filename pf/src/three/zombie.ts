@@ -24,7 +24,8 @@ export class NetZombie {
   readonly id: number
   state: ZNetState = 'enter'
   hp = 500
-  readonly maxHp = 500
+  /** 血量上限：随快照 max_hp 同步（补员僵尸世代递增），HUD 血条比例分母 */
+  maxHp = 500
   stamina = 100
   readonly maxStamina = 100
   vulnMul = 0
@@ -134,6 +135,7 @@ export class NetZombie {
   applyState(s: NetZombieState, first = false) {
     const prev = this.state
     this.hp = s.hp
+    this.maxHp = s.max_hp || 500
     this.stamina = s.st
     this.vulnMul = s.vuln
     this.hasTarget = s.target

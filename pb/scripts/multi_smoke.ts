@@ -15,6 +15,7 @@
  * 11. 重击剑气蓄力：hold=0.5 → 伤害 15×dmgMul；hold=2 钳到蓄力上限 1.0 → 30×dmgMul
  * 12. 暴击：critRate=1 连击全部 sign=2（伤害 ×(1+critDmg)）；critRate=0 恢复 sign=1
  * 13. 冲击力：玩家 impact=1.5 → 僵尸落手扣体 10×1.5=15
+ * 14. 僵尸死亡 → 门处自动补员更强僵尸（hp 540 / dmgBonus 1）+ 三选一冻结与解除
  *
  * 用例 11-13 通过同进程导出的 world 单例做确定性铺垫（关暴击 / 摆僵尸位 / 设词条），
  * 战斗结算本身仍走完整协议链路（mp_input / mp_action → PB 裁决 → 事件广播）。
@@ -434,6 +435,33 @@ async function main(): Promise<void> {
       const drop = Math.round((st0 - z.stamina) * 100)
       assert(drop === 1500, `僵尸扣体 = Z_ATTACK_COST 10 × 1.5 = 15（实际 ${st0.toFixed(2)} → ${z.stamina.toFixed(2)}，差 ${(drop / 100).toFixed(2)}）`)
       pa.stats.impact = 1
+    })) && ok
+
+  ok =
+    (await step('僵尸死亡 → 门处自动补员更强僵尸（hp 540 / 伤害+1）+ 三选一冻结与解除', async () => {
+      await sleep(400) // 攻击冷却
+      // 等活僵尸进入 A 攻击距离（REACH 3.0）
+      await waitWorld(a, (w) => {
+        const z = w.zombies.find((x: AnyMsg) => x.state !== 'dead')
+        if (!z) return false
+        return Math.hypot(z.p[0] - -3.0, z.p[2] - 1.9) <= 3.0
+      }, '僵尸进入攻击距离', 8000)
+      const z0 = world.zombies.find((x) => x.state !== 'dead')!
+      z0.hp = 1 // 直改血量：A 下一击必死（击杀结算走完整协议链路）
+      send(a, 'mp_action', nextSeq(), { kind: 'attack', segment: 0 })
+      const die = await recvWhere(a, (m) => m.type === 'event' && m.payload.kind === 'zdie' && m.payload.id === z0.id, 'zdie 事件')
+      assert(die.payload.id === z0.id, `被击杀僵尸 id=${z0.id}`)
+      // 三选一开启 + 快照携带补员 max_hp=540（PF 血条比例分母）
+      await waitWorld(a, (w) => w.pick_phase === true && w.zombies.some((z: AnyMsg) => z.max_hp === 540), 'pick_phase 开启 + max_hp=540')
+      // 补员：门处（ZOMBIE_SPAWN -4.55,1.9）生成 hp=500+40、dmgBonus=1 的更强僵尸
+      const z1 = world.zombies.find((x) => x.id !== z0.id)
+      assert(z1 !== undefined, '补员僵尸已生成')
+      assert(z1!.hp === 540, `补员血量上限 = 500+40（实际 ${z1!.hp}）`)
+      assert(z1!.dmgBonus === 1, `补员伤害加成 +1（实际 ${z1!.dmgBonus}）`)
+      assert(z1!.x === -4.55 && z1!.z === 1.9, `补员出生在门处（实际 ${z1!.x},${z1!.z}）`)
+      // A 选择增益 → 解除冻结
+      send(a, 'mp_action', nextSeq(), { kind: 'pick', idx: 0 })
+      await waitWorld(a, (w) => w.pick_phase === false, 'pick_phase 解除')
     })) && ok
 
   // ---------- 清理并退出 ----------
