@@ -151,7 +151,9 @@ export interface MpInputPayload {
 
 /** PF → PB 动作意图 */
 export interface MpActionPayload {
-  kind: 'attack' | 'parry_start' | 'parry_stop' | 'respawn' | 'wave' | 'pick' | 'revive' | 'lamp'
+  kind:
+    | 'attack' | 'parry_start' | 'parry_stop' | 'respawn' | 'wave' | 'pick' | 'revive' | 'lamp'
+    | 'weapon' | 'shoot' | 'charge_start' | 'charge_stop'
   /** attack 专用：0-2 三段连击 / 3 空中戳刺（PB：伤害同首段，冲击力 25；普攻/反击/追击 3，重击剑气 11） */
   segment?: number
   /** wave 专用：蓄力时长 s（PB 按每秒 10 体力结算消耗） */
@@ -160,7 +162,12 @@ export interface MpActionPayload {
   idx?: number
   /** revive 专用：要复活的队友（尸体）uuid */
   target?: string
+  /** weapon 专用：切换到的武器 */
+  weapon?: WeaponId
 }
+
+/** 武器 ID（与 PB WeaponId 同构）：双手剑 / 苍弓 */
+export type WeaponId = 'sword' | 'bow'
 
 export type ZNetState =
   | 'enter' | 'chase' | 'windup' | 'recover' | 'stunned' | 'dead'
@@ -189,6 +196,8 @@ export interface NetPlayerState {
   huaqi: number;
   /** 防御（受伤减免：最终伤害 = 原始 × 500 / (490 + def)，初始 10 → ×1 基准） */
   def: number;
+  /** 当前武器（Q/E 切换，PB 权威回写） */
+  weapon: WeaponId;
   /** 三选一状态（进行中非空）：抽到的 3 个增益索引 + 是否已选 */
   pick: { options: number[]; done: boolean } | null;
 }
@@ -234,7 +243,13 @@ export type MpEventPayload =
   | { kind: 'counter_open' }
   | { kind: 'roar_interrupt'; id: number }
   /** 重击剑气：by 玩家从 (x,y,z) 沿 3D (dx,dy,dz) 发射，绕飞行轴随机 roll 旋转（各 PF 本地渲染飞行视觉 + 与 PB 同公式定向，伤害由 PB 弹道裁决） */
-  | { kind: 'wave'; by: string; x: number; y: number; z: number; dx: number; dy: number; dz: number; roll: number };
+  | { kind: 'wave'; by: string; x: number; y: number; z: number; dx: number; dy: number; dz: number; roll: number }
+  /** 苍弓射球：by 玩家从 (x,y,z) 沿 3D (dx,dy,dz) 发射球状闪电（PF 本地渲染飞行视觉，伤害由 PB 裁决） */
+  | { kind: 'orb'; by: string; id: number; x: number; y: number; z: number; dx: number; dy: number; dz: number }
+  /** 球状闪电停止前进：target = 附着目标 key（PF 跟随目标渲染）；null = 球消失（PF 移除视觉） */
+  | { kind: 'orb_stop'; id: number; x: number; y: number; z: number; target: string | null }
+  /** 苍弓蓄满爆发：一道 40 伤激光沿 (dx,dy,dz)（PF 播爆发特效 + 微震，伤害由 PB 射线裁决） */
+  | { kind: 'beam_burst'; by: string; x: number; y: number; z: number; dx: number; dy: number; dz: number };
 
 export interface HeartbeatPayload {
   acq_connected: boolean;

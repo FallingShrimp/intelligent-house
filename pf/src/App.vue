@@ -170,6 +170,8 @@ onBeforeUnmount(() => {
       <div v-else-if="hud.blockCd01 < 1" class="block-fill gray" :style="{ width: hud.blockCd01 * 100 + '%' }"></div>
     </div>
     <div v-if="locked && hud && hud.chaseLeft > 0" class="chase-tag">追击 ×{{ hud.chaseLeft }}</div>
+    <!-- 当前武器名（Q/E 切换，PB 快照回写） -->
+    <div v-if="locked && hud" class="weapon-tag">{{ hud.weaponName }}</div>
     <!-- 僵尸目标条 -->
     <div v-if="locked && hud && hud.target" class="zombie-bar">
       <div class="zb-name">僵尸</div>
@@ -373,6 +375,19 @@ onBeforeUnmount(() => {
   color: #ffd76a;
   font-size: 12px;
   font-weight: 600;
+  text-shadow: 0 0 4px rgba(0, 0, 0, 0.8);
+  pointer-events: none;
+}
+/* 当前武器名（准星下方，Q/E 切换提示） */
+.weapon-tag {
+  position: absolute;
+  top: calc(50% + 42px);
+  left: 50%;
+  transform: translateX(-50%);
+  color: #9fd8ff;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: 1px;
   text-shadow: 0 0 4px rgba(0, 0, 0, 0.8);
   pointer-events: none;
 }

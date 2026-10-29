@@ -2,18 +2,21 @@
  * 第一人称近战格斗（联机版）：PB 权威裁决 + PF 本地表现
  *
  * - AI / 伤害 / 体力 / 眩晕全部由 PB world.ts 结算；PF 只做：
- *   1) 本地剑视模型动画与手感（点击立即起挥）
- *   2) 动作意图上报（mp_action：attack / parry_start / parry_stop）
+ *   1) 本地武器视模型动画与手感（点击立即起挥）
+ *   2) 动作意图上报（mp_action：attack / shoot / parry / wave / charge_*）
  *   3) PB 下发的 hp / 体力 / 眩晕 / 追击窗口渲染（HUD）
  *   4) 伤害 / 格挡事件 → 飘字 / 音效 / 闪光（SceneManager 分发）
- * - 三段连击循环：向左挥 90% → 向右挥 90% → 从上往下劈 150%（基础 10）
- * - 反击戳刺 300% / 追击上劈 120% 的判定在 PB；PF 依据本地可见状态
- *   （僵尸眩晕窗口 / chase_left）选择对应的本地动画
+ * - 武器系统：BaseWeapon 抽象（输入生命周期编排）+ 双手剑 / 苍弓实现。
+ *   PlayerCombat 为编排器（PB 状态同步 / 格挡 / 蓄力状态机 / 飘字 / HUD），
+ *   武器只负责「普攻怎么打、蓄力怎么表现、重击怎么上报」。
+ * - 双手剑：三段连击循环（左挥 90% → 右挥 90% → 劈砍 150%）+ 反击戳刺 300% /
+ *   追击上劈 120%（判定在 PB，PF 依据本地可见状态选择动画）+ 蓄力剑气。
  */
 import * as THREE from 'three'
 import { pbClient } from '../ws/client'
-import type { NetPlayerState, NetZombieState } from '../protocol/messages'
+import type { NetPlayerState, NetZombieState, WeaponId } from '../protocol/messages'
 import { playSfx } from './audio'
+import { buildBow, buildBowOrb } from './bow'
 import { buildSword } from './sword'
 import type { NetZombie } from './zombie'
 
@@ -50,13 +53,67 @@ export interface CombatHud {
 	incomingSkill: 'normal' | 'sweep' | 'lunge' | null
 	/** 重击蓄力进度 0~1（未蓄力为 null；UI 准星扇环） */
 	charge: number | null
+	/** 当前武器 ID 与名称（HUD 展示） */
+	weapon: WeaponId
+	weaponName: string
 	target: { hp: number; maxHp: number; stamina: number; maxStamina: number; vulnMul: number } | null
+}
+
+/** 武器普攻上下文（编排器每次点击时组装） */
+export interface AttackCtx {
+	zombies: NetZombie[]
+	remotes: RemoteCenter[]
+	camera: THREE.PerspectiveCamera
+	onGround: boolean
+	/** 准星指向的场景交互物（台灯 / 门 / 电视等）：远程武器不吞交互用（近战武器忽略） */
+	interactTag?: string | null
+}
+
+/**
+ * 武器抽象（PF 侧 = 输入编排 + 视模型表现）：
+ * - normalAttack：点击普攻（返回 true = 已消费本次点击）
+ * - startCharge：按下左键开始蓄力（返回 true = SceneManager 冻结移动）
+ * - heavyAttack：松开左键（timeCharged = 已蓄秒数；返回 true = 松开被武器消费，
+ *   否则编排层回落普攻链——双手剑短按回落普攻语义在此实现）
+ * - maxChargeReached：update 每帧轮询，蓄满是否立即停手并触发 heavyAttack
+ *   （双手剑恒 false = 蓄满不自动释放；苍弓 true = 蓄满自动爆发）
+ */
+export abstract class BaseWeapon {
+	abstract weaponName: string
+	protected readonly c: PlayerCombat
+	protected constructor(c: PlayerCombat) {
+		this.c = c
+	}
+	abstract attach(camera: THREE.Camera): void
+	abstract setVisible(v: boolean): void
+	abstract normalAttack(now: number, ctx: AttackCtx): boolean
+	abstract startCharge(now: number): boolean
+	abstract heavyAttack(timeCharged: number, now: number): boolean
+	abstract maxChargeReached(now: number): boolean
+	/** 无交互目标时的空挥（保持手感，同样上报意图） */
+	abstract whiff(now: number): void
+	/** 当前动作标签（mp_input.anim，供远程玩家渲染） */
+	abstract animTag(): string | null
+	/** 打断当前动作（眩晕 / 突进命中等） */
+	abstract interrupt(): void
+	/** 帧更新：武器内部动画推进 */
+	abstract update(dt: number, now: number): void
+	/** 帧更新：视模型姿态 */
+	abstract updatePose(dt: number, now: number): void
+	/** 蓄力被取消（拖拽视角 / 眩晕破防打断）：弓上报 charge_stop 同步 PB，剑无需处理 */
+	onChargeCancel(): void {}
+	abstract dispose(): void
 }
 
 const BLOCK_CD_S = 0.5
 const REACH = 3.0
 const REACH_ANGLE = 0.55
 const COUNTER_REACH = 3.4
+
+/** 武器名（HUD 显示 / 切换提示） */
+export const WEAPON_NAMES: Record<WeaponId, string> = { sword: '双手剑', bow: '苍弓' }
+/** 武器循环顺序（Q = 上一把 / E = 下一把） */
+const WEAPON_CYCLE: WeaponId[] = ['sword', 'bow']
 
 // ---------------- 剑术动作关键帧（与单机版一致） ----------------
 
@@ -138,6 +195,10 @@ interface FloatReq {
 	kind: FloatKind
 }
 
+/**
+ * 玩家战斗编排器：PB 权威数值同步 / 格挡与蓄力状态机 / 武器实例切换 / 飘字 / HUD。
+ * 普攻 / 重击的具体行为委托给当前武器（BaseWeapon 实现）。
+ */
 export class PlayerCombat {
 	// PB 权威数值（world 快照写入；上限/时长类随三选一增益经 setNet 更新）
 	hp = 100
@@ -150,23 +211,17 @@ export class PlayerCombat {
 	blockMaxS = 1.0      // 格挡最大持续 s（增益 +0.25s）
 	parryPct = 0.5       // 完美格挡窗口 = blockMaxS × parryPct（增益 +2%）
 	chargeDur = 1.0      // 重击蓄力时长 s（蓄力速度增益 → 时长缩短）
+	weaponId: WeaponId = 'sword' // 当前武器（PB 快照回写）
+	/** 重击蓄力开始（本地 loop 秒；>=0 表示蓄力中——剑 / 弓共用编排层状态） */
+	chargeStart = -1
 
 	private stunUntilLocal = 0  // loop 秒钟基准的眩晕截止（快照 stun_for 折算）
 	private guardBreakUntil = 0
 	private blockStart = 0
 	private blockCdUntil = 0
-	private combo = -1
-	private buffered: number | null = null
-	private cur: SwingDef | null = null
-	private curT = 0
-	private ghosts: Ghost[] = []
-	private lastGhost = -1
 	private hudEmit = 0
 	private now = 0
-	private sword: THREE.Group | null = null
-	private chargeStart = -1   // >=0 表示蓄力重击中（按住左键）
 	private chargeNotified = false // 蓄满提示音已播
-	private stabPitch: number | null = null // 空中戳刺俯仰（anim 上报 stab|<pitch>）
 	private disposed = false
 	private floats: FloatReq[] = []
 
@@ -174,22 +229,30 @@ export class PlayerCombat {
 	private tmpF = new THREE.Vector3()
 	private tmpD = new THREE.Vector3()
 
-	private hooks: CombatHooks
+	/** HUD / 镜头回调（武器实例可访问：飘字 / 镜头 slerp 等） */
+	readonly hooks: CombatHooks
+	/** 当前武器实例（按快照 weapon 切换） */
+	weapon: BaseWeapon
+	private weapons: Record<WeaponId, BaseWeapon>
+	private visible = true
 
 	constructor(hooks: CombatHooks) {
 		this.hooks = hooks
+		this.weapons = { sword: new SwordWeapon(this), bow: new BowWeapon(this) }
+		this.weapon = this.weapons.sword
 	}
 
 	attach(camera: THREE.Camera) {
-		this.sword = buildSword()
-		this.sword.scale.setScalar(0.55)
-		this.sword.position.set(...BASE_P)
-		this.sword.rotation.set(...BASE_R)
-		camera.add(this.sword)
+		for (const id of WEAPON_CYCLE) this.weapons[id].attach(camera)
+		// 非当前武器默认隐藏（当前武器可见性随 SceneManager setVisible 驱动）
+		for (const id of WEAPON_CYCLE) {
+			if (id !== this.weaponId) this.weapons[id].setVisible(false)
+		}
 	}
 
 	setVisible(v: boolean) {
-		if (this.sword) this.sword.visible = v
+		this.visible = v
+		this.weapon.setVisible(v)
 	}
 
 	// ---------------- PB 快照 / 事件入口 ----------------
@@ -206,6 +269,14 @@ export class PlayerCombat {
 		this.blockMaxS = mine.max_block
 		this.parryPct = mine.parry_pct
 		this.chargeDur = mine.charge_dur
+		// 武器切换（PB 快照回写）：换当前武器实例并同步可见性
+		if (mine.weapon !== this.weaponId) {
+			this.weaponId = mine.weapon
+			this.weapon.setVisible(false)
+			this.weapon = this.weapons[this.weaponId]
+			this.weapon.setVisible(this.visible)
+			this.emitHud(true)
+		}
 		// 死亡（hp=0）：强制结束本地格挡，等待玩家点击「复活」
 		if (mine.hp <= 0 && this.blocking) {
 			this.blocking = false
@@ -228,11 +299,7 @@ export class PlayerCombat {
 
 	/** 突进命中等：打断当前挥剑与格挡 */
 	interruptAction() {
-		if (this.cur) {
-			this.cur = null
-			this.buffered = null
-			this.stabPitch = null
-		}
+		this.weapon.interrupt()
 		if (this.blocking) {
 			this.blocking = false
 			this.blockCdUntil = this.now + BLOCK_CD_S
@@ -245,85 +312,60 @@ export class PlayerCombat {
 		this.floats.push({ pos: pos.clone(), text, kind })
 	}
 
-	// ---------------- 输入（本地动画 + 意图上报） ----------------
+	/** 武器提示（反击发现等），转发 hooks */
+	toast(text: string) {
+		this.hooks.onToast(text)
+	}
+
+	// ---------------- 输入编排（委托当前武器） ----------------
 
 	/**
-	 * 左键：眩晕 / 破防中吞掉点击；反击 / 追击 / 空中戳刺 / 三段连击按本地可见状态
-	 * 选择动画并上报 attack 意图（伤害由 PB 裁决）。无目标返回 false 交给场景交互。
+	 * 左键点击普攻：眩晕 / 破防中吞掉点击；具体行为（反击 / 追击 / 空中戳刺 /
+	 * 三段连击 / 射球）由当前武器决定并上报意图。返回 false = 未消费（交给场景交互）。
+	 * interactTag = 准星指向的场景交互物（远程武器不吞交互用，近战忽略）。
 	 */
-	onLeftClick(now: number, zombies: NetZombie[], remotes: RemoteCenter[], camera: THREE.PerspectiveCamera, onGround: boolean): boolean {
+	normalAttack(now: number, zombies: NetZombie[], remotes: RemoteCenter[], camera: THREE.PerspectiveCamera, onGround: boolean, interactTag: string | null = null): boolean {
 		if (this.hp <= 0) return true // 死亡：吞掉点击（复活经死亡覆盖层按钮）
 		if (this.stunUntilLocal > now) return true
 		if (now < this.guardBreakUntil) return true
 		if (this.blocking) this.endBlock(now)
-
-		// 反击：僵尸眩晕后 1s 窗口内（PB 同规则裁决）
-		const counterTarget = zombies.find(
-			(z) => z.state === 'stunned' && z.centerPos.distanceTo(camera.position) <= COUNTER_REACH,
-		)
-		if (counterTarget) {
-			this.startSwing(SWING_THRUST, now)
-			pbClient.sendMpAction({ kind: 'attack', segment: 0 })
-			this.hooks.onToast('反击！')
-			return true
-		}
-
-		// 追击：反击后的全局连打窗口
-		if (this.chaseLeft > 0 && this.findTarget(zombies, remotes, camera)) {
-			this.startSwing(SWING_CHASE, now)
-			pbClient.sendMpAction({ kind: 'attack', segment: 0 })
-			return true
-		}
-
-		// 空中戳刺：滞空左键 → 3.4m 内最近目标，复用戳刺动画 + 镜头转向目标
-		if (!onGround && !this.cur) {
-			const stab = this.findStabTarget(zombies, remotes, camera)
-			if (stab) {
-				this.startSwing(SWING_THRUST, now)
-				// segment 3 = 空中戳刺标识（PB：伤害同首段，冲击力 25）
-				pbClient.sendMpAction({ kind: 'attack', segment: 3 })
-				this.stabPitch = Math.asin(THREE.MathUtils.clamp(stab.dir.y, -1, 1))
-				this.hooks.onStabAim(stab.dir)
-				return true
-			}
-			// 无目标：落到下方普通挥砍逻辑
-		}
-
-		const hasTarget = this.findTarget(zombies, remotes, camera) !== null
-		if (!hasTarget && !this.cur) return false // 无目标 → 场景交互
-
-		if (this.cur) {
-			if (this.curT / this.cur.dur > 0.4) this.buffered = (this.combo + 1) % 3
-			return true
-		}
-		this.combo = (this.combo + 1) % 3
-		this.startSwing(COMBO[this.combo], now)
-		pbClient.sendMpAction({ kind: 'attack', segment: this.combo })
-		return true
+		return this.weapon.normalAttack(now, { zombies, remotes, camera, onGround, interactTag })
 	}
 
-	/** 空中戳刺目标：僵尸 + 远程玩家中心，取最近且 ≤3.4m（返回指向目标的单位向量） */
-	private findStabTarget(zombies: NetZombie[], remotes: RemoteCenter[], camera: THREE.PerspectiveCamera): { dir: THREE.Vector3 } | null {
-		let best: THREE.Vector3 | null = null
-		let bd = COUNTER_REACH
-		for (const z of zombies) {
-			if (z.dead) continue
-			const d = this.tmpD.copy(z.centerPos).sub(camera.position)
-			if (d.length() < bd) { bd = d.length(); best = d.clone() }
-		}
-		for (const r of remotes) {
-			const d = this.tmpD.set(r.x, r.y, r.z).sub(camera.position)
-			if (d.length() < bd) { bd = d.length(); best = d.clone() }
-		}
-		return best ? { dir: best.normalize() } : null
+	/** 空挥（无交互目标时保持手感；死亡 / 眩晕中忽略） */
+	whiffSwing(now: number): void {
+		if (this.hp <= 0 || this.stunUntilLocal > now) return
+		this.weapon.whiff(now)
 	}
 
-	/** 无交互目标时的空挥（保持手感，同样上报意图） */
-	whiffSwing(now: number) {
-		if (this.cur || this.stunUntilLocal > now) return
-		this.combo = (this.combo + 1) % 3
-		this.startSwing(COMBO[this.combo], now)
-		pbClient.sendMpAction({ kind: 'attack', segment: this.combo })
+	/** 按下左键：开始重击蓄力（成功后 SceneManager 冻结移动） */
+	startCharge(now: number): boolean {
+		return this.weapon.startCharge(now)
+	}
+
+	/** 已蓄力时长 s（未蓄力返回 0） */
+	chargeHold(now: number): number {
+		return this.chargeStart < 0 ? 0 : now - this.chargeStart
+	}
+
+	/** 取消蓄力（松开未满 / 拖拽 / 状态打断）：通知武器同步 PB（弓上报 charge_stop） */
+	endCharge(): void {
+		if (this.chargeStart >= 0) {
+			this.chargeStart = -1
+			this.weapon.onChargeCancel()
+		}
+	}
+
+	/** 松开左键：武器结算重击（未蓄满返回 false 回落普攻链） */
+	heavyAttack(timeCharged: number, now: number): boolean {
+		return this.weapon.heavyAttack(timeCharged, now)
+	}
+
+	/** 循环切换武器：返回目标武器（PB 快照回写后 weaponId 才真正变化） */
+	cycleWeapon(dir: 1 | -1): WeaponId {
+		const i = WEAPON_CYCLE.indexOf(this.weaponId)
+		const n = WEAPON_CYCLE.length
+		return WEAPON_CYCLE[((i + dir) % n + n) % n]
 	}
 
 	startBlock(now: number): boolean {
@@ -345,51 +387,12 @@ export class PlayerCombat {
 		this.emitHud(true)
 	}
 
-	/** 当前动作标签（mp_input.anim，供远程玩家渲染简单动作；空中戳刺带俯仰 stab|<pitch>） */
+	/** 当前动作标签（mp_input.anim，供远程玩家渲染；武器标签优先，格挡兜底） */
 	currentAnimTag(): string | null {
-		if (this.cur) return this.stabPitch !== null ? `stab|${this.stabPitch.toFixed(2)}` : this.cur.tag
-		if (this.chargeStart >= 0) return 'charge'
+		const t = this.weapon.animTag()
+		if (t) return t
 		if (this.blocking) return 'block'
 		return null
-	}
-
-	// ---------------- 重击蓄力 ----------------
-
-	/** 是否可行动（未死亡 / 未眩晕 / 未破防） */
-	canAct(now: number): boolean {
-		return this.hp > 0 && this.stunUntilLocal <= now && now >= this.guardBreakUntil
-	}
-
-	/** 按下左键：开始蓄力（成功后 SceneManager 冻结移动） */
-	beginCharge(now: number): boolean {
-		if (!this.canAct(now) || this.blocking) return false
-		this.chargeStart = now
-		this.chargeNotified = false
-		return true
-	}
-
-	/** 已蓄力时长 s（未蓄力返回 0） */
-	chargeHold(now: number): number {
-		return this.chargeStart < 0 ? 0 : now - this.chargeStart
-	}
-
-	/** 取消蓄力（松开未满 / 拖拽 / 状态打断） */
-	endCharge(): void {
-		this.chargeStart = -1
-	}
-
-	/** 蓄满释放：上劈动画 + 发射剑气意图（未蓄满返回 false；hold 供 PB 结算蓄力体力消耗） */
-	fireWave(now: number): boolean {
-		if (this.chargeStart < 0 || now - this.chargeStart < this.chargeDur) {
-			this.chargeStart = -1
-			return false
-		}
-		const hold = now - this.chargeStart
-		this.chargeStart = -1
-		this.combo = -1 // 剑气不算三段连击
-		this.startSwing(SWING_CHASE, now)
-		pbClient.sendMpAction({ kind: 'wave', hold: Math.round(hold * 10) / 10 })
-		return true
 	}
 
 	// ---------------- 帧更新 ----------------
@@ -397,32 +400,24 @@ export class PlayerCombat {
 	update(dt: number, now: number, camera: THREE.PerspectiveCamera, active: boolean) {
 		if (this.disposed) return
 		this.now = now
-		if (!active || !this.sword) return
+		if (!active) return
 
 		// 格挡最长持续时间
 		if (this.blocking && now - this.blockStart >= this.blockMaxS) this.endBlock(now)
-		// 蓄力中状态失效（死亡 / 眩晕 / 破防）→ 自动取消
-		if (this.chargeStart >= 0 && !this.canAct(now)) this.chargeStart = -1
+		// 蓄力中状态失效（死亡 / 眩晕 / 破防）→ 自动取消（弓上报 charge_stop，PB stopCharge 幂等）
+		if (this.chargeStart >= 0 && !this.canAct(now)) this.endCharge()
 		// 蓄满瞬间提示音（每次蓄力只播一次）
 		if (this.chargeStart >= 0 && !this.chargeNotified && now - this.chargeStart >= this.chargeDur) {
 			this.chargeNotified = true
 			playSfx('flashAlert')
 		}
-
-		// 挥砍推进（伤害判定在 PB，这里只推进动画与缓存连段）
-		if (this.cur) {
-			this.curT += dt
-			if (this.curT >= this.cur.dur) {
-				this.cur = null
-				this.stabPitch = null
-				if (this.buffered !== null) {
-					this.combo = this.buffered
-					this.buffered = null
-					this.startSwing(COMBO[this.combo], now, true)
-					pbClient.sendMpAction({ kind: 'attack', segment: this.combo })
-				}
-			}
+		// 蓄满自动停手：武器 maxChargeReached → 立刻 heavyAttack（苍弓爆发挂点；剑恒 false）
+		if (this.chargeStart >= 0 && this.weapon.maxChargeReached(now)) {
+			this.weapon.heavyAttack(now - this.chargeStart, now)
 		}
+
+		// 武器内部动画推进（挥砍 / 缓冲连段 / 幽灵）
+		this.weapon.update(dt, now)
 
 		// 飘字投影
 		for (const f of this.floats) {
@@ -434,15 +429,8 @@ export class PlayerCombat {
 		}
 		this.floats.length = 0
 
-		this.updateGhosts(dt)
-		this.updatePose(dt, now)
-
-		// 蓄力重击姿态：剑举过头顶微微发抖（覆盖待机 / 格挡姿态）
-		if (this.chargeStart >= 0 && !this.cur && this.sword) {
-			const shake = Math.sin(now * 24) * 0.012
-			this.sword.position.set(BASE_P[0] + shake, BASE_P[1] + 0.34, BASE_P[2] - 0.08)
-			this.sword.rotation.set(BASE_R[0] - 2.3 + shake * 2, BASE_R[1], BASE_R[2] + 0.15)
-		}
+		// 武器视模型姿态（挥砍 / 格挡 / 蓄力 / 待机）
+		this.weapon.updatePose(dt, now)
 
 		if (now - this.hudEmit > 0.1) this.emitHud()
 	}
@@ -459,12 +447,14 @@ export class PlayerCombat {
 			stamina: Math.round(this.stamina),
 			maxStamina: Math.round(this.maxSt),
 			blocking: this.blocking,
-			blockAge01: blockAge,
 			blockPerfect: this.blocking && now - this.blockStart <= this.blockMaxS * this.parryPct,
+			blockAge01: blockAge,
 			blockCd01: Math.max(0, Math.min(1, cd)),
 			stunnedFor: Math.max(0, this.stunUntilLocal - now),
 			chaseLeft: this.chaseLeft,
 			charge: this.chargeStart >= 0 ? Math.min(1, (now - this.chargeStart) / this.chargeDur) : null,
+			weapon: this.weaponId,
+			weaponName: WEAPON_NAMES[this.weaponId],
 			incomingSkill: incoming
 				? incoming.state === 'sweep' ? 'sweep' : incoming.state === 'lungeWind' ? 'lunge' : 'normal'
 				: null,
@@ -476,49 +466,23 @@ export class PlayerCombat {
 
 	dispose() {
 		this.disposed = true
-		for (const g of this.ghosts) {
-			g.obj.removeFromParent()
-			g.mat.dispose()
-		}
-		this.ghosts = []
-		if (this.sword) {
-			this.sword.traverse((o) => {
-				const m = o as THREE.Mesh
-				if (m.isMesh) {
-					m.geometry.dispose()
-					; (m.material as THREE.Material).dispose()
-				}
-			})
-			this.sword.removeFromParent()
-			this.sword = null
-		}
+		this.floats.length = 0
+		for (const id of WEAPON_CYCLE) this.weapons[id].dispose()
 	}
 
 	// ---------------- 私有 ----------------
 
-	/** 普攻目标（本地预判，PB 同规则裁决）：僵尸 + 远程玩家同池取最近 */
-	private findTarget(zombies: NetZombie[], remotes: RemoteCenter[], camera: THREE.PerspectiveCamera): RemoteCenter | null {
-		const pool: RemoteCenter[] = zombies.filter((z) => !z.dead).map((z) => {
-			const c = z.centerPos
-			return { uuid: `z${z.id}`, x: c.x, y: c.y, z: c.z }
-		})
-		pool.push(...remotes)
-		camera.getWorldDirection(this.tmpF)
-		let best: RemoteCenter | null = null
-		let bestD = Infinity
-		const cp = camera.position
-		for (const c of pool) {
-			const d = Math.hypot(c.x - cp.x, c.y - cp.y, c.z - cp.z)
-			if (d > REACH) continue
-			if (cp.x > -3.5 !== c.x > -3.5 && (c.z < 1.35 || c.z > 2.45)) continue
-			this.tmpD.set(c.x - cp.x, c.y - cp.y, c.z - cp.z).normalize()
-			if (this.tmpD.angleTo(this.tmpF) > REACH_ANGLE) continue
-			if (d < bestD) {
-				bestD = d
-				best = c
-			}
-		}
-		return best
+	/** 是否可行动（未死亡 / 未眩晕 / 未破防） */
+	canAct(now: number): boolean {
+		return this.hp > 0 && this.stunUntilLocal <= now && now >= this.guardBreakUntil
+	}
+
+	/** 武器开始蓄力（编排层统一状态；返回是否成功） */
+	tryBeginCharge(now: number): boolean {
+		if (!this.canAct(now) || this.blocking) return false
+		this.chargeStart = now
+		this.chargeNotified = false
+		return true
 	}
 
 	/** HUD 准星软锁定目标（仅僵尸状态栏） */
@@ -542,24 +506,163 @@ export class PlayerCombat {
 		return best
 	}
 
-	private startSwing(def: SwingDef, now: number, silent = false) {
-		this.cur = def
-		this.curT = 0
-		this.lastGhost = now
-		if (!silent) {
-			if (def === SWING_THRUST) playSfx('counter')
-			else if (def === SWING_CHASE) playSfx('counter2')
-			else playSfx('swing')
-		}
-		this.emitHud(true)
-	}
-
 	private emitHud(force = false) {
 		if (force) this.hudEmit = this.now
 		this.hooks.onHud()
 	}
+}
 
-	private updatePose(dt: number, now: number) {
+/** 编排器蓄力状态由武器读写（剑蓄力姿态 / 苍弓拉弓姿态共用） */
+export interface ChargeStateHost extends PlayerCombat {}
+
+// ---------------- 双手剑（现攻击逻辑解耦，行为不变） ----------------
+
+class SwordWeapon extends BaseWeapon {
+	weaponName = '双手剑'
+
+	constructor(c: PlayerCombat) {
+		super(c)
+	}
+
+	private sword: THREE.Group | null = null
+	private combo = -1
+	private buffered: number | null = null
+	private cur: SwingDef | null = null
+	private curT = 0
+	private ghosts: Ghost[] = []
+	private lastGhost = -1
+	private stabPitch: number | null = null // 空中戳刺俯仰（anim 上报 stab|<pitch>）
+
+	private tmpF = new THREE.Vector3()
+	private tmpD = new THREE.Vector3()
+
+	attach(camera: THREE.Camera) {
+		this.sword = buildSword()
+		this.sword.scale.setScalar(0.55)
+		this.sword.position.set(...BASE_P)
+		this.sword.rotation.set(...BASE_R)
+		camera.add(this.sword)
+	}
+
+	setVisible(v: boolean) {
+		if (this.sword) this.sword.visible = v
+	}
+
+	/**
+	 * 普攻：反击 / 追击 / 空中戳刺 / 三段连击按本地可见状态选择动画并上报 attack
+	 * 意图（伤害由 PB 裁决）。无目标返回 false 交给场景交互。
+	 */
+	normalAttack(now: number, ctx: AttackCtx): boolean {
+		const c = this.c
+		// 反击：僵尸眩晕后 1s 窗口内（PB 同规则裁决）
+		const counterTarget = ctx.zombies.find(
+			(z) => z.state === 'stunned' && z.centerPos.distanceTo(ctx.camera.position) <= COUNTER_REACH,
+		)
+		if (counterTarget) {
+			this.startSwing(SWING_THRUST, now)
+			pbClient.sendMpAction({ kind: 'attack', segment: 0 })
+			c.toast('反击！')
+			return true
+		}
+
+		// 追击：反击后的全局连打窗口
+		if (c.chaseLeft > 0 && this.findTarget(ctx)) {
+			this.startSwing(SWING_CHASE, now)
+			pbClient.sendMpAction({ kind: 'attack', segment: 0 })
+			return true
+		}
+
+		// 空中戳刺：滞空左键 → 3.4m 内最近目标，复用戳刺动画 + 镜头转向目标
+		if (!ctx.onGround && !this.cur) {
+			const stab = this.findStabTarget(ctx)
+			if (stab) {
+				this.startSwing(SWING_THRUST, now)
+				// segment 3 = 空中戳刺标识（PB：伤害同首段，冲击力 25）
+				pbClient.sendMpAction({ kind: 'attack', segment: 3 })
+				this.stabPitch = Math.asin(THREE.MathUtils.clamp(stab.dir.y, -1, 1))
+				c.hooks.onStabAim(stab.dir)
+				return true
+			}
+			// 无目标：落到下方普通挥砍逻辑
+		}
+
+		const hasTarget = this.findTarget(ctx) !== null
+		if (!hasTarget && !this.cur) return false // 无目标 → 场景交互
+
+		if (this.cur) {
+			if (this.curT / this.cur.dur > 0.4) this.buffered = (this.combo + 1) % 3
+			return true
+		}
+		this.combo = (this.combo + 1) % 3
+		this.startSwing(COMBO[this.combo], now)
+		pbClient.sendMpAction({ kind: 'attack', segment: this.combo })
+		return true
+	}
+
+	/** 按下左键：开始蓄力（成功后 SceneManager 冻结移动） */
+	startCharge(now: number): boolean {
+		return this.c.tryBeginCharge(now)
+	}
+
+	/** 蓄满释放：上劈动画 + 发射剑气意图（未蓄满返回 false；hold 供 PB 结算蓄力体力消耗） */
+	heavyAttack(timeCharged: number, now: number): boolean {
+		const c = this.c
+		if (c.chargeStart < 0 || now - c.chargeStart < c.chargeDur) {
+			c.chargeStart = -1
+			return false
+		}
+		c.chargeStart = -1
+		this.combo = -1 // 剑气不算三段连击
+		this.startSwing(SWING_CHASE, now)
+		pbClient.sendMpAction({ kind: 'wave', hold: Math.round(timeCharged * 10) / 10 })
+		return true
+	}
+
+	/** 蓄满不自动释放（松手才发剑气） */
+	maxChargeReached(_now: number): boolean { return false }
+
+	/** 无交互目标时的空挥（保持手感，同样上报意图） */
+	whiff(now: number) {
+		if (this.cur) return
+		this.combo = (this.combo + 1) % 3
+		this.startSwing(COMBO[this.combo], now)
+		pbClient.sendMpAction({ kind: 'attack', segment: this.combo })
+	}
+
+	animTag(): string | null {
+		if (this.cur) return this.stabPitch !== null ? `stab|${this.stabPitch.toFixed(2)}` : this.cur.tag
+		if (this.c.chargeStart >= 0) return 'charge'
+		return null
+	}
+
+	interrupt() {
+		if (this.cur) {
+			this.cur = null
+			this.buffered = null
+			this.stabPitch = null
+		}
+	}
+
+	update(dt: number, now: number) {
+		// 挥砍推进（伤害判定在 PB，这里只推进动画与缓存连段）
+		if (this.cur) {
+			this.curT += dt
+			if (this.curT >= this.cur.dur) {
+				this.cur = null
+				this.stabPitch = null
+				if (this.buffered !== null) {
+					this.combo = this.buffered
+					this.buffered = null
+					this.startSwing(COMBO[this.combo], now, true)
+					pbClient.sendMpAction({ kind: 'attack', segment: this.combo })
+				}
+			}
+		}
+		this.updateGhosts(dt)
+	}
+
+	updatePose(dt: number, now: number) {
+		const c = this.c
 		const sword = this.sword
 		if (!sword) return
 		if (this.cur) {
@@ -571,7 +674,7 @@ export class PlayerCombat {
 				this.lastGhost = now
 				this.spawnGhost()
 			}
-		} else if (this.blocking) {
+		} else if (c.blocking) {
 			const k = Math.min(1, dt * 14)
 			sword.position.lerp(BLOCK_P, k)
 			sword.rotation.x += (BLOCK_R[0] - sword.rotation.x) * k
@@ -580,12 +683,94 @@ export class PlayerCombat {
 		} else {
 			const bob = Math.sin(now * 2.2) * 0.009
 			const k = Math.min(1, dt * 10)
-			this.tmpV.set(BASE_P[0], BASE_P[1] + bob, BASE_P[2])
-			sword.position.lerp(this.tmpV, k)
+			this.tmpD.set(BASE_P[0], BASE_P[1] + bob, BASE_P[2])
+			sword.position.lerp(this.tmpD, k)
 			sword.rotation.x += (BASE_R[0] + Math.sin(now * 1.7) * 0.015 - sword.rotation.x) * k
 			sword.rotation.y += (BASE_R[1] - sword.rotation.y) * k
 			sword.rotation.z += (BASE_R[2] - sword.rotation.z) * k
 		}
+
+		// 蓄力重击姿态：剑举过头顶微微发抖（覆盖待机 / 格挡姿态）
+		if (c.chargeStart >= 0 && !this.cur) {
+			const shake = Math.sin(now * 24) * 0.012
+			sword.position.set(BASE_P[0] + shake, BASE_P[1] + 0.34, BASE_P[2] - 0.08)
+			sword.rotation.set(BASE_R[0] - 2.3 + shake * 2, BASE_R[1], BASE_R[2] + 0.15)
+		}
+	}
+
+	dispose() {
+		for (const g of this.ghosts) {
+			g.obj.removeFromParent()
+			g.mat.dispose()
+		}
+		this.ghosts = []
+		if (this.sword) {
+			this.sword.traverse((o) => {
+				const m = o as THREE.Mesh
+				if (m.isMesh) {
+					m.geometry.dispose()
+					; (m.material as THREE.Material).dispose()
+				}
+			})
+			this.sword.removeFromParent()
+			this.sword = null
+		}
+	}
+
+	// ---------------- 剑私有 ----------------
+
+	/** 普攻目标（本地预判，PB 同规则裁决）：僵尸 + 远程玩家同池取最近 */
+	private findTarget(ctx: AttackCtx): RemoteCenter | null {
+		const pool: RemoteCenter[] = ctx.zombies.filter((z) => !z.dead).map((z) => {
+			const c = z.centerPos
+			return { uuid: `z${z.id}`, x: c.x, y: c.y, z: c.z }
+		})
+		pool.push(...ctx.remotes)
+		ctx.camera.getWorldDirection(this.tmpF)
+		let best: RemoteCenter | null = null
+		let bestD = Infinity
+		const cp = ctx.camera.position
+		for (const c of pool) {
+			const d = Math.hypot(c.x - cp.x, c.y - cp.y, c.z - cp.z)
+			if (d > REACH) continue
+			if (cp.x > -3.5 !== c.x > -3.5 && (c.z < 1.35 || c.z > 2.45)) continue
+			this.tmpD.set(c.x - cp.x, c.y - cp.y, c.z - cp.z).normalize()
+			if (this.tmpD.angleTo(this.tmpF) > REACH_ANGLE) continue
+			if (d < bestD) {
+				bestD = d
+				best = c
+			}
+		}
+		return best
+	}
+
+	/** 空中戳刺目标：僵尸 + 远程玩家中心，取最近且 ≤3.4m（返回指向目标的单位向量） */
+	private findStabTarget(ctx: AttackCtx): { dir: THREE.Vector3 } | null {
+		let best: THREE.Vector3 | null = null
+		let bd = COUNTER_REACH
+		const cp = ctx.camera.position
+		for (const z of ctx.zombies) {
+			if (z.dead) continue
+			const d = this.tmpD.copy(z.centerPos).sub(cp)
+			if (d.length() < bd) { bd = d.length(); best = d.clone() }
+		}
+		for (const r of ctx.remotes) {
+			const d = this.tmpD.set(r.x, r.y, r.z).sub(cp)
+			if (d.length() < bd) { bd = d.length(); best = d.clone() }
+		}
+		return best ? { dir: best.normalize() } : null
+	}
+
+	private startSwing(def: SwingDef, now: number, silent = false) {
+		this.cur = def
+		this.curT = 0
+		this.lastGhost = now
+		if (!silent) {
+			if (def === SWING_THRUST) playSfx('counter')
+			else if (def === SWING_CHASE) playSfx('counter2')
+			else playSfx('swing')
+		}
+		this.c.hooks.onHud()
 	}
 
 	private spawnGhost() {
@@ -622,6 +807,181 @@ export class PlayerCombat {
 				g.mat.opacity = 0.38 * (g.life / g.ttl)
 			}
 		}
+	}
+}
+
+// ---------------- 苍弓（球状闪电 / 巨型激光：视模型与意图编排） ----------------
+
+/** 弓姿态关键帧（挂相机：rotation.y ≈ π/2 使弧顶朝 -Z 前方，弦竖直贴玩家侧） */
+const BOW_P: [number, number, number] = [0.3, -0.3, -0.58]
+const BOW_R: [number, number, number] = [0.06, Math.PI / 2 - 0.12, 0.05]
+/** 拉弓瞄准姿态（居中前伸正对准星） */
+const BOW_AIM_P: [number, number, number] = [0.18, -0.24, -0.5]
+const BOW_AIM_R: [number, number, number] = [0.02, Math.PI / 2, 0]
+/** 射球动画：发射瞬间弓前推 → 回位（起点为瞄准位，直接点击时由关键帧平滑过渡） */
+const BOW_SHOOT: SwingDef = {
+	dur: 0.28, tickAt: 0.1, tag: 'shoot',
+	keys: [
+		{ t: 0, p: BOW_AIM_P, r: BOW_AIM_R },
+		{ t: 0.35, p: [0.26, -0.28, -0.68], r: [0.1, Math.PI / 2 - 0.05, 0.02] },
+		{ t: 1, p: BOW_P, r: BOW_R },
+	],
+}
+
+class BowWeapon extends BaseWeapon {
+	weaponName = '苍弓'
+
+	constructor(c: PlayerCombat) {
+		super(c)
+	}
+
+	private bow: THREE.Group | null = null
+	private orbTip: THREE.Mesh | null = null // 搭弦能量球（蓄力显示，随进度增大）
+	private cur: SwingDef | null = null
+	private curT = 0
+
+	private tmpD = new THREE.Vector3()
+
+	attach(camera: THREE.Camera) {
+		this.bow = buildBow()
+		this.bow.scale.setScalar(0.55)
+		this.bow.position.set(...BOW_P)
+		this.bow.rotation.set(...BOW_R)
+		this.orbTip = buildBowOrb()
+		this.orbTip.position.set(0.05, 0, 0) // 弦中央略朝弧顶（弓 group 内系）
+		this.bow.add(this.orbTip)
+		camera.add(this.bow)
+	}
+
+	setVisible(v: boolean) {
+		if (this.bow) this.bow.visible = v
+	}
+
+	/**
+	 * 普攻：射球状闪电意图（伤害由 PB 裁决；远程无目标也射）。
+	 * 准星指向场景交互物（台灯 / 门等）时返回 false 交还交互。
+	 */
+	normalAttack(_now: number, ctx: AttackCtx): boolean {
+		if (ctx.interactTag) return false // 交互优先（不吞台灯 / 开门）
+		if (this.cur) return true // 射球动画节流（0.28s ≈ PB 攻击最小间隔）
+		this.startShoot(true)
+		return true
+	}
+
+	/** 按下左键：拉弓蓄力（本地编排状态 + charge_start 意图，激光表现由蓄力态驱动） */
+	startCharge(now: number): boolean {
+		if (!this.c.tryBeginCharge(now)) return false
+		pbClient.sendMpAction({ kind: 'charge_start' })
+		return true
+	}
+
+	/**
+	 * 松开左键：未蓄满 → charge_stop 停止激光；蓄满 → 本地镜像停手即可
+	 * （爆发由 PB tick 轮询自动触发，特效 / 音效等 PB beam_burst 事件驱动，避免双端双重）。
+	 */
+	heavyAttack(timeCharged: number, _now: number): boolean {
+		const c = this.c
+		if (c.chargeStart < 0) return true // 蓄满自动停手后的松手余波
+		const full = timeCharged >= c.chargeDur - 1e-3
+		c.chargeStart = -1
+		this.startShoot(false) // 弓回弹后摆（不重复上报 shoot）
+		if (!full) pbClient.sendMpAction({ kind: 'charge_stop' })
+		return true
+	}
+
+	/** 蓄满自动停手（本地镜像；PB 侧 tick 轮询同规则，事件为准防视觉漂移） */
+	maxChargeReached(now: number): boolean {
+		return this.c.chargeStart >= 0 && now - this.c.chargeStart >= this.c.chargeDur
+	}
+
+	/** 无交互目标空放 = 照常射球（远程武器） */
+	whiff(_now: number) {
+		if (this.cur) return
+		this.startShoot(true)
+	}
+
+	animTag(): string | null {
+		if (this.cur) return this.cur.tag
+		if (this.c.chargeStart >= 0) return 'beam' // 蓄力中（远端渲染激光挂点）
+		return null
+	}
+
+	/** 打断（击退等）：停止拉弓并同步 PB 停激光（眩晕 / 破防取消由编排层 endCharge 走 onChargeCancel） */
+	interrupt() {
+		this.cur = null
+		if (this.c.chargeStart >= 0) {
+			this.c.chargeStart = -1
+			pbClient.sendMpAction({ kind: 'charge_stop' })
+		}
+	}
+
+	/** 蓄力被取消（拖拽视角 / 状态失效）：同步 PB 停止激光 */
+	onChargeCancel(): void {
+		pbClient.sendMpAction({ kind: 'charge_stop' })
+	}
+
+	update(dt: number, _now: number) {
+		if (this.cur) {
+			this.curT += dt
+			if (this.curT >= this.cur.dur) this.cur = null
+		}
+	}
+
+	updatePose(dt: number, now: number) {
+		const c = this.c
+		const bow = this.bow
+		if (!bow) return
+		if (this.cur) {
+			const { p, r } = sampleSwing(this.cur, Math.min(1, this.curT / this.cur.dur))
+			bow.position.set(p[0], p[1], p[2])
+			bow.rotation.set(r[0], r[1], r[2])
+		} else {
+			const bob = Math.sin(now * 2.2) * 0.008
+			const k = Math.min(1, dt * 10)
+			this.tmpD.set(BOW_P[0], BOW_P[1] + bob, BOW_P[2])
+			bow.position.lerp(this.tmpD, k)
+			bow.rotation.x += (BOW_R[0] + Math.sin(now * 1.7) * 0.015 - bow.rotation.x) * k
+			bow.rotation.y += (BOW_R[1] - bow.rotation.y) * k
+			bow.rotation.z += (BOW_R[2] - bow.rotation.z) * k
+			// 蓄力拉弓姿态：弓居中前伸 + 能量球随蓄力进度增大
+			if (c.chargeStart >= 0) {
+				const charge01 = Math.min(1, (now - c.chargeStart) / c.chargeDur)
+				const kc = Math.min(1, dt * 12)
+				this.tmpD.set(BOW_AIM_P[0], BOW_AIM_P[1] + bob, BOW_AIM_P[2])
+				bow.position.lerp(this.tmpD, kc)
+				bow.rotation.x += (BOW_AIM_R[0] - bow.rotation.x) * kc
+				bow.rotation.y += (BOW_AIM_R[1] - bow.rotation.y) * kc
+				bow.rotation.z += (BOW_AIM_R[2] - bow.rotation.z) * kc
+				if (this.orbTip) {
+					this.orbTip.visible = true
+					this.orbTip.scale.setScalar(0.6 + charge01 * 1.0)
+				}
+			} else if (this.orbTip) {
+				this.orbTip.visible = false
+			}
+		}
+	}
+
+	dispose() {
+		if (this.bow) {
+			this.bow.traverse((o) => {
+				const m = o as THREE.Mesh
+				if (m.isMesh) {
+					m.geometry.dispose()
+					; (m.material as THREE.Material).dispose()
+				}
+			})
+			this.bow.removeFromParent()
+			this.bow = null
+			this.orbTip = null
+		}
+	}
+
+	private startShoot(sendIntent: boolean) {
+		this.cur = BOW_SHOOT
+		this.curT = 0
+		if (this.orbTip) this.orbTip.visible = false
+		if (sendIntent) pbClient.sendMpAction({ kind: 'shoot' })
 	}
 }
 

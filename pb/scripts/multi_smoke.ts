@@ -16,6 +16,11 @@
  * 12. 暴击：critRate=1 连击全部 sign=2（伤害 ×(1+critDmg)）；critRate=0 恢复 sign=1
  * 13. 冲击力：玩家 impact=1.5 → 僵尸落手扣体 10×1.5=15
  * 14. 僵尸死亡 → 门处自动补员更强僵尸（hp 540 / dmgBonus 1）+ 三选一冻结与解除
+ * 15. 苍弓普攻：射球状闪电 → 首中附着（orb_stop target）+ 0.1s×3 伤 tick（不暴击）+ 6s TTL 到期消失
+ * 16. 苍弓激光：charge_start → 0.2s×15 伤 tick（穿透双僵尸）+ 蓄力中切武器被拒 + charge_stop 停止
+ * 17. 蓄满自动爆发：charge ≥ chargeDur → 40 伤一次 + chargeStartAt 清空 + 激光停止
+ * 18. 提前松手：charge_stop → 无爆发无残留 tick；松手后切武器生效
+ * 19. 切回双手剑：shoot 走近战裁决（三段 90%=9 伤）且不再产生 orb
  *
  * 用例 11-13 通过同进程导出的 world 单例做确定性铺垫（关暴击 / 摆僵尸位 / 设词条），
  * 战斗结算本身仍走完整协议链路（mp_input / mp_action → PB 裁决 → 事件广播）。
@@ -323,6 +328,10 @@ async function main(): Promise<void> {
 
   ok =
     (await step('普通格挡（非完美窗口）：无伤扣体 = 普攻冲击力 3（parry.drain 随攻击类型动态）', async () => {
+      // 僵尸挪到门廊最深处：case 7 曾把它摆到 x=20 被 zClamp 钉回 3.4（约 6.7s 追到 A），
+      // 恰可能在本用例窗口内插手攻击产生干扰 parry 事件 → 拉开追击距离保证确定性
+      const z8 = world.zombies.find((x) => x.state !== 'dead')
+      if (z8) { z8.x = -5.0; z8.z = 1.9 }
       send(b, 'mp_action', nextSeq(), { kind: 'parry_stop' })
       await sleep(600) // 格挡起手冷却
       for (let i = 0; i < 5; i++) {
@@ -459,9 +468,130 @@ async function main(): Promise<void> {
       assert(z1!.hp === 540, `补员血量上限 = 500+40（实际 ${z1!.hp}）`)
       assert(z1!.dmgBonus === 1, `补员伤害加成 +1（实际 ${z1!.dmgBonus}）`)
       assert(z1!.x === -4.55 && z1!.z === 1.9, `补员出生在门处（实际 ${z1!.x},${z1!.z}）`)
-      // A 选择增益 → 解除冻结
-      send(a, 'mp_action', nextSeq(), { kind: 'pick', idx: 0 })
+      // A 选择增益 → 解除冻结（确定性：选自己抽中的第一项，idx 0 不一定在 options 里）
+      send(a, 'mp_action', nextSeq(), { kind: 'pick', idx: world.players.get(uuidA)!.pick!.options[0] })
       await waitWorld(a, (w) => w.pick_phase === false, 'pick_phase 解除')
+    })) && ok
+
+  // ---------- 用例 15-19：苍弓（球状闪电 / 巨型激光，PB 权威裁决） ----------
+
+  ok =
+    (await step('苍弓普攻：射球状闪电 → 首中附着 + 0.1s×3 伤 tick（不暴击）+ 6s TTL 到期消失', async () => {
+      const z = world.zombies.find((x) => x.state !== 'dead')!
+      // A 切换苍弓（快照回写）
+      send(a, 'mp_action', nextSeq(), { kind: 'weapon', weapon: 'bow' })
+      await waitWorld(a, (w) => w.players.find((p: AnyMsg) => p.uuid === uuidA)?.weapon === 'bow', 'A weapon=bow')
+      // 朝 +x 站位，僵尸摆在正前方 3.5m（射线 y=1.6 过僵尸头部采样点 1.75，垂距 0.15 ≤ 0.55）
+      input(a, [-3.0, 1.6, 1.9], [1, 0], 'fp')
+      await sleep(150)
+      z.x = 0.5; z.z = 1.9
+      send(a, 'mp_action', nextSeq(), { kind: 'shoot' })
+      const orb = await recvWhere(a, (m) => m.type === 'event' && m.payload.kind === 'orb' && m.payload.by === uuidA, 'orb 事件')
+      assert(typeof orb.payload.id === 'number', `orb 携带 id=${orb.payload.id}`)
+      // 首中即停：orb_stop 携带僵尸目标 key，并立刻开始附着 tick
+      const stop = await recvWhere(a, (m) => m.type === 'event' && m.payload.kind === 'orb_stop' && m.payload.id === orb.payload.id, 'orb_stop(附着)')
+      assert(stop.payload.target === `z${z.id}`, `附着目标 key=z${z.id}（实际 ${stop.payload.target}）`)
+      for (let i = 0; i < 3; i++) {
+        const d = await recvWhere(a, (m) => m.type === 'event' && m.payload.kind === 'dmg_z' && m.payload.by === uuidA && m.payload.amount === 3, `球 tick 3 伤 (#${i + 1})`)
+        assert(d.payload.sign === 1, `球 tick 不暴击 sign=1（实际 ${d.payload.sign}）`)
+      }
+      // TTL 6s（自发射起计）：附着跟随目标，到期 → orb_stop(target=null) 消失
+      z.x = 3.0; z.z = 1.9
+      const gone = await recvWhere(a, (m) => m.type === 'event' && m.payload.kind === 'orb_stop' && m.payload.id === orb.payload.id && m.payload.target === null, 'orb 到期消失', 10000)
+      assert(gone.payload.target === null, '到期 orb_stop target=null')
+      assert(!world.orbs.some((o) => o.id === orb.payload.id), 'world.orbs 已移除该球')
+    })) && ok
+
+  ok =
+    (await step('苍弓激光：charge_start → 0.2s×15 伤 tick 穿透双僵尸；蓄力中切武器被拒；charge_stop 停止', async () => {
+      const pa = world.players.get(uuidA)!
+      pa.hp = 100; pa.stamina = 100; pa.stunUntil = 0; pa.exhaustUntil = 0; pa.guardBreakUntil = 0
+      pa.stats.critRate = 0
+      // 补第二只僵尸，等其进入 chase 后双双摆上射线（穿透断言）
+      send(a, 'mp_action', nextSeq(), { kind: 'lamp' })
+      await waitWorld(a, (w) => w.zombies.some((x: AnyMsg) => x.id !== world.zombies[0].id && x.state === 'chase'), '第二只僵尸 chase')
+      const zs = world.zombies.filter((x) => x.state !== 'dead')
+      for (const z of zs) z.vulnMul = 0 // 确定性：清掉可能的眩晕易伤倍率（伤害断言为固定值）
+      input(a, [-3.0, 1.6, 1.9], [1, 0], 'fp')
+      await sleep(150)
+      zs[0].x = 0.5; zs[0].z = 1.9
+      zs[1].x = 1.5; zs[1].z = 1.9
+      send(a, 'mp_action', nextSeq(), { kind: 'charge_start' })
+      // 蓄力中切武器 → PB 拒绝（快照仍 bow）
+      send(a, 'mp_action', nextSeq(), { kind: 'weapon', weapon: 'sword' })
+      for (const z of zs) {
+        const d = await recvWhere(a, (m) => m.type === 'event' && m.payload.kind === 'dmg_z' && m.payload.id === z.id && m.payload.amount === 15, `激光 tick 15 (z${z.id})`)
+        assert(d.payload.by === uuidA, '激光伤害归属 A')
+      }
+      await waitWorld(a, (w) => w.players.find((p: AnyMsg) => p.uuid === uuidA)?.weapon === 'bow', '蓄力中切武器被拒（仍 bow）')
+      send(a, 'mp_action', nextSeq(), { kind: 'charge_stop' })
+      await sleep(350) // 让停止前最后一批在途事件落地
+      const mark = a.inbox.length
+      await sleep(600)
+      const late = a.inbox.slice(mark).filter((m) => m.type === 'event' && m.payload.kind === 'dmg_z' && m.payload.amount === 15)
+      assert(late.length === 0, `charge_stop 后无激光 tick（发现 ${late.length} 条）`)
+      assert(pa.chargeStartAt === -1, 'chargeStartAt 已清空')
+    })) && ok
+
+  ok =
+    (await step('蓄满自动爆发：charge ≥ chargeDur(1s) → 40 伤一次 + chargeStartAt 清空 + 激光停止', async () => {
+      const pa = world.players.get(uuidA)!
+      pa.hp = 100; pa.stamina = 100; pa.stunUntil = 0; pa.exhaustUntil = 0; pa.guardBreakUntil = 0
+      const zs = world.zombies.filter((x) => x.state !== 'dead')
+      for (const z of zs) z.vulnMul = 0
+      input(a, [-3.0, 1.6, 1.9], [1, 0], 'fp')
+      await sleep(150)
+      zs[0].x = 2.5; zs[0].z = 1.9
+      zs[1].x = 3.3; zs[1].z = 1.9
+      send(a, 'mp_action', nextSeq(), { kind: 'charge_start' })
+      // 不松手：World tick 轮询 maxChargeReached → 自动 heavyAttack 爆发（射线判定，穿透）
+      const burst = await recvWhere(a, (m) => m.type === 'event' && m.payload.kind === 'dmg_z' && m.payload.amount === 40 && m.payload.by === uuidA, '爆发 40 伤', 4000)
+      assert(burst.payload.sign === 1, `爆发不暴击 sign=1（实际 ${burst.payload.sign}）`)
+      assert(pa.chargeStartAt === -1, '爆发后 chargeStartAt 清空（立刻停止）')
+      await sleep(350)
+      const mark = a.inbox.length
+      await sleep(600)
+      const late = a.inbox.slice(mark).filter((m) => m.type === 'event' && m.payload.kind === 'dmg_z' && (m.payload.amount === 40 || m.payload.amount === 15))
+      assert(late.length === 0, `爆发后激光停止（发现 ${late.length} 条残留）`)
+    })) && ok
+
+  ok =
+    (await step('提前松手：charge_stop → 无爆发无残留 tick；松手后切武器生效（对照蓄力中被拒）', async () => {
+      const pa = world.players.get(uuidA)!
+      pa.hp = 100; pa.stamina = 100; pa.stunUntil = 0; pa.exhaustUntil = 0; pa.guardBreakUntil = 0
+      send(a, 'mp_action', nextSeq(), { kind: 'charge_start' })
+      await sleep(250) // 激光 1-2 tick（僵尸在射线远端，伤害不影响断言）
+      send(a, 'mp_action', nextSeq(), { kind: 'charge_stop' })
+      await sleep(350) // 等动作落地 + 在途事件收口
+      assert(pa.chargeStartAt === -1, 'charge_stop 清空蓄力')
+      const mark = a.inbox.length
+      await sleep(600)
+      const late = a.inbox.slice(mark).filter((m) => m.type === 'event' && m.payload.kind === 'dmg_z' && (m.payload.amount === 40 || m.payload.amount === 15))
+      assert(late.length === 0, `提前松手无爆发无 tick（发现 ${late.length} 条）`)
+      // 松手（非蓄力）时切武器生效
+      send(a, 'mp_action', nextSeq(), { kind: 'weapon', weapon: 'sword' })
+      await waitWorld(a, (w) => w.players.find((p: AnyMsg) => p.uuid === uuidA)?.weapon === 'sword', '松手后切回 sword')
+    })) && ok
+
+  ok =
+    (await step('切回双手剑回归：shoot 走近战裁决（三段 90%=9 伤）且不再产生 orb', async () => {
+      const pa = world.players.get(uuidA)!
+      pa.hp = 100; pa.stamina = 100; pa.stunUntil = 0; pa.guardBreakUntil = 0
+      pa.stats.atk = 10 // 确定性：case 14 三选一可能加了攻击力词条，重置保证近战 9 伤断言
+      const z = world.zombies.find((x) => x.state !== 'dead')!
+      z.vulnMul = 0
+      input(a, [-3.0, 1.6, 1.9], [1, 0], 'fp')
+      await sleep(150)
+      z.x = -2.0; z.z = 1.9
+      await sleep(400) // 攻击最小间隔
+      const mark = a.inbox.length
+      send(a, 'mp_action', nextSeq(), { kind: 'shoot' })
+      await sleep(600)
+      const hit = a.inbox.slice(mark).filter((m) => m.type === 'event' && m.payload.kind === 'dmg_z' && m.payload.by === uuidA && m.payload.amount === 9)
+      assert(hit.length >= 1, `sword 的 shoot 走近战 9 伤（命中 ${hit.length} 条）`)
+      const noOrb = a.inbox.slice(mark).filter((m) => m.type === 'event' && m.payload.kind === 'orb')
+      assert(noOrb.length === 0, 'sword 的 shoot 不产生 orb')
+      assert(pa.weapon === 'sword', 'A 当前武器 sword')
     })) && ok
 
   // ---------- 清理并退出 ----------

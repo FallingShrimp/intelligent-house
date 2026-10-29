@@ -1,268 +1,236 @@
-# 重构计划：词条系统 / 伤害系统 / 战斗行为 / 运维按钮
+# 武器系统重构计划：BaseWeapon 抽象 / 双手剑解耦 / 新武器「苍弓」
 
-> 依据 todo.md 拆解，供审核。当前架构：PB（`pb/src/world.ts`）为唯一权威，PF（`pf/`）只做表现与意图上报；协议两端各有一份（PB `protocol.ts` zod strict ↔ PF `messages.ts`），字段必须同步。
+> 依据 todo.md 拆解，供审核。当前架构：PB（`pb/src/world.ts`）为唯一权威（伤害 / 弹道 / 体力全部裁决），PF（`pf/src/three/combat.ts` + `SceneManager.ts`）只做表现与意图上报；协议两端各一份（PB `protocol.ts` zod strict ↔ PF `messages.ts`），字段必须成对同步。
+
+---
+
+## 〇、现状链路（调研结论）
+
+**输入生命周期（PF `SceneManager.ts`）**
+- 按下左键（L388-391）：`combat.beginCharge(now)` 成功 → `charging = true`（移动减速 50%，L971-979）
+- 松开左键（L411-435）：charging → `combat.fireWave(now)`（hold < chargeDur 视为未蓄满，返回 false 回落普攻链：复活尸体 → `onLeftClick`（反击 / 追击 / 空中戳刺 / 三段连击）→ 场景交互 → `whiffSwing` 空挥）；拖拽视角 → `endCharge`
+- 蓄满仅播提示音（`combat.ts` L407-410），**不会**自动释放 → 双手剑 `maxChargeReached` 语义应为 false
+
+**PB 裁决（`world.ts`）**
+- `action()` L345：mp_action 分发（attack / parry / wave / pick / revive / lamp / respawn）
+- `playerAttack()` L493：普攻裁决——眩晕窗口内反击 300%（开全局追击窗口）→ 追击 120% → 三段 90/90/150 × atk × dmgMul；segment 3 = 空中戳刺（impact 25）
+- `fireWave()` L398 + `tickWaves()` L433：重击剑气——effHold = min(hold × chargeSpd, chargeMax)，伤害 = atk × 300% × effHold × dmgMul，体力 10 × effHold，multiWave 连发队列（tick L1189 追发）；弹道 WAVE_SPEED 12 / TTL 1.2s / 扇形碰撞箱穿透 / `wave` 事件（3D 向量 + roll）→ 各 PF 渲染
+- `useStamina()` L847：扣体力 = 基值 × 攻击者冲击力 / 受击者稳定性；`playerHit()` L526：暴击掷点 + impact；`damageZombie` / `damagePlayer` / `hurtPlayer` 统一走 `DamageSource`
+
+**结论**：BaseWeapon 抽象需要**两端各一个**（同名抽象、各自职责）——PB 侧负责**裁决**（伤害结算入口），PF 侧负责**输入编排**（点击 / 按住 / 松开 → 意图上报 + 动画）。协议只传意图与事件，武器逻辑不进协议。
 
 ---
 
 ## 一、任务树与依赖关系
 
 ```
-T1 词条 Record 化（基础设施，最先做）
-├── T2 新词条（依赖 T1 的 Record + 快照字段）
-│   ├── T2a 蓄力上限 + 重击伤害公式改造
-│   ├── T2b 冲击力 / 稳定性（依赖 T3 的 DamageSource.impact 通道）
-│   └── T2c 暴击率 / 暴击伤害（依赖 T3 的 sign 通道）
-├── T5 三选一池扩展（依赖 T1/T2：新词条入池档位）
-└── （快照 / PF HUD 同步随各任务走）
+W1 武器基础设施：协议扩展 + 切换机制（最先做，两端协议同步）
+├── W2 PB 侧 BaseWeapon 抽象 + 双手剑解耦（依赖 W1 的 weapon 字段）
+├── W3 PF 侧 BaseWeapon 抽象 + 双手剑解耦（依赖 W1；与 W2 无耦合可并行）
+│   └── W5 苍弓 PF 表现（依赖 W3 的武器化编排 + W4 的事件定稿 + W1 协议）
+└── W4 苍弓 PB 裁决：球状闪电 + 巨型激光（依赖 W2 的武器实例挂载）
 
-T3 伤害系统 DamageSource 重构（依赖 T1：impact/stability 取自词条）
-└── T2b / T2c 建立在其之上
-
-T4 闪避 Bug 修复（独立，可随时做）
-T6 空中戳刺（独立；删 airMul 与 T3 同文件，排在 T3 之后减少冲突）
-T7 重启 PB 按钮（完全独立，PB index.ts + StatusBar.vue + protocol）
+W6 集成验证与回归（依赖全部）
 ```
 
-**实施顺序**：T1 → T3 → T2a → T2b → T2c → T5 → T4 → T6 → T7。
-每个任务完成后跑：`bunx tsc --noEmit` + `bun run smoke` + `bun scripts/multi_smoke.ts`（pb 目录）；`npm run build`（pf 目录）。
+**实施顺序**：W1 → W2 ∥ W3 → W4 → W5 → W6。
+每任务完成后跑：cd pb `bunx tsc --noEmit` + `bun run smoke` + `bun scripts/multi_smoke.ts`；cd pf `npm run build`。W2/W3 为**行为等价重构**（回归绿即过），W4/W5 新增功能断言。
 
 ---
 
 ## 二、各任务具体修改点
 
-### T1 词条系统：玩家数值统一 Record 管理
+### W1 武器基础设施：协议扩展 + 切换机制
+
+**PB `protocol.ts`**
+- `MpActionPayloadSchema.kind` 枚举扩展（L239）：新增 `'weapon' | 'shoot' | 'charge_start' | 'charge_stop'`；新增可选字段 `weapon: z.enum(['sword', 'bow'])`（weapon 专用）。
 
 **PB `world.ts`**
+- 新增 `type WeaponId = 'sword' | 'bow'`；`MpPlayer` 增字段 `weapon: WeaponId`（join 默认 `'sword'`）、`chargeStartAt: number`（苍弓重击开始时刻，-1 = 未蓄力）。
+- `action()` L345：签名同步新增 kind；`'weapon'` → 校验后 `p.weapon = d.weapon`（蓄力 / 激光中禁止切换，直接拒绝）；`'shoot'` / `'charge_start'` / `'charge_stop'` → 路由到 `p.weapon` 对应武器实例（W2 落地后接通）。
+- `snapshot()` L1227：players 增 `weapon` 字段。
+- 常量：`ORB_SPEED`（16 m/s，可调）、`ORB_TTL_S = 6`（球状闪电持续 6 秒）、`ORB_TICK_S = 0.1`、`BEAM_TICK_S = 0.2`。
 
-- 新增类型与默认表（模块级）：
+**PF `messages.ts`**
+- `MpActionPayload`（L153）同步 kind 枚举 + `weapon` 字段；`NetPlayerState`（L169）增 `weapon: 'sword' | 'bow'`。
+
+**PF 切换交互**
+- `SceneManager.ts`：Q / E 键（handleKeyDown，已按下方向 Q=上一把 / E=下一把，循环切换）→ 锁定且存活时 `pbClient.sendMpAction({ kind: 'weapon', weapon: 目标武器 })` + 本地乐观提示 toast；PB 快照回写后 `combat.setWeapon(...)` 生效（以 PB 为准，不做本地预切）。当前 2 把武器时 Q/E 效果相同，但按键语义按上/下一个实现，武器扩容后天然可用。
+- `App.vue`：HUD 显示当前武器名（读快照），切换 toast。
+
+**验收**：tsc / smoke / multi / build 全绿；Q/E 切换后快照 weapon 变化、断线重连不丢。
+
+---
+
+### W2 PB 侧：BaseWeapon 抽象 + 双手剑解耦（行为等价重构）
+
+**`world.ts` 新增**（武器裁决挂载）：
 
 ```ts
-type StatKey =
-  | 'atk' | 'maxHp' | 'maxSt' | 'parryPct' | 'blockMaxS' | 'dmgMul'
-  | 'chargeSpd' | 'chargeMax' | 'thorn' | 'lifesteal' | 'multiWave'
-  | 'impact' | 'stability' | 'critRate' | 'critDmg'
-
-const STAT_DEFAULTS: Record<StatKey, number> = {
-  atk: 10, maxHp: 100, maxSt: 100, parryPct: 0.5, blockMaxS: 1.0,
-  dmgMul: 1, chargeSpd: 1, chargeMax: 1.0, thorn: 0, lifesteal: 0,
-  multiWave: 0, impact: 1, stability: 1, critRate: 0.05, critDmg: 1.0,
+abstract class BaseWeapon {
+	abstract weaponName: string
+	/** 普攻裁决（点击） */
+	abstract normalAttack(p: MpPlayer, segment: number, now: number): void
+	/** 开始重击蓄力 */
+	abstract startCharge(p: MpPlayer, now: number): void
+	/** 提前松手（未蓄满） */
+	abstract stopCharge(p: MpPlayer, now: number): void
+	/** 重击蓄力完成（松开满蓄 / tick 轮询蓄满自动触发） */
+	abstract heavyAttack(p: MpPlayer, timeCharged: number, now: number): void
+	/** tick 轮询：蓄力达到上限时返回 true → 调用方立刻 heavyAttack 并停止重击 */
+	abstract maxChargeReached(p: MpPlayer, now: number): boolean
+	/** 持续行为钩子（激光 tick / 连发剑气队列），可选 */
+	tick?(p: MpPlayer, dt: number, now: number): void
 }
 ```
 
-- `MpPlayer`：删除 `atk/maxHp/parryPct/maxSt/blockMaxS/dmgMul/chargeSpd/thorn/lifesteal/multiWave` 10 个散字段 → 一个 `stats: Record<StatKey, number>`（`join()` 里 `stats: { ...STAT_DEFAULTS }`）。
-- 全文替换引用：`p.atk` → `p.stats.atk` 等（约 40+ 处，含 `damageZombie` 吸血、`applyPicks`、`fireWave`、`snapshot`、`playerAttack` 三段、体力公式等）。提供私有 helper `private st(p: MpPlayer, k: StatKey): number` 可选——直接 `p.stats[k]` 即可，不引入多余抽象。
-- `snapshot()` 字段名与数值不变（PF 端无感知），仅新增 T2 的字段。
+- `World` 增 `private weapons: Record<WeaponId, BaseWeapon>`（构造时注入 Sword / Bow 实例，Bow 本任务先空壳占位）。
+- `action()` 分发改造：`'attack'` → `weapons[p.weapon].normalAttack(p, segment, now)`；`'wave'` → 视为「蓄满松手」→ `heavyAttack(p, hold, now)`；`'shoot'` / `'charge_start'` / `'charge_stop'` → 同名方法。
+- `tick()` L1182 玩家循环内：`weapons[p.weapon].tick?.(p, dt, now)`；`maxChargeReached(p, now)` 为 true 时 → `heavyAttack(p, 蓄满时长, now)` 并清 `chargeStartAt`。
 
-**PF 侧**：本任务无改动（快照字段不变）。
+**`SwordWeapon extends BaseWeapon`（双手剑）**
+- `normalAttack` = 现 `playerAttack()` L493-523 原逻辑平移（反击 300% / 追击 120% / 三段 / segment 3 空中戳刺，含 `findMeleeTarget` / `playerHit` 调用，不动）。
+- `heavyAttack(p, timeCharged, now)` = 现 `fireWave()` L398-410 原逻辑（effHold = min(timeCharged × chargeSpd, chargeMax)、`emitWave`、体力 10 × effHold、multiWave 入队），**行为完全不变**。
+- `startCharge` / `stopCharge` = 空实现（剑的蓄力是纯 PF 本地概念，PB 只在 wave 上报时用 hold 结算）。
+- `maxChargeReached` = `false`（保持现行为：蓄满不自动释放，松手才发）。
+- `tick` = 现 tick L1189-1197 的 waveQueue 连发剑气逻辑平移（每 0.1s 追发满蓄剑气）。
 
-**验收**：tsc 通过；smoke / multi_smoke 全绿（数值行为与重构前完全一致）。
+**验证**：现有 smoke（12）/ multi_smoke 全部断言不变全绿（数值行为与重构前一致）；删除 `fireWave` / `playerAttack` 原方法（无兼容残留）。
 
 ---
 
-### T3 伤害系统：DamageSource 对象
+### W3 PF 侧：BaseWeapon 抽象 + 双手剑解耦（行为等价重构）
 
-**PB `world.ts`**
-
-- 新增：
+**`combat.ts` 新增**（输入编排挂载）：
 
 ```ts
-/** 伤害符号：治疗 / 被闪避·格挡 / 正常 / 暴击 */
-enum DamageSign {
-  Heal = -1,
-  Blocked = 0,
-  Normal = 1,
-  Crit = 2,
+export interface AttackCtx {
+	zombies: NetZombie[]
+	remotes: RemoteCenter[]
+	camera: THREE.PerspectiveCamera
+	onGround: boolean
 }
-
-interface DamageSource {
-  from: string          // 'p:<uuid>' | 'z:<id>' | 'sys'
-  amount: number        // 绝对值，>0
-  sign: DamageSign
-  impact: number        // 受击者扣除的体力基值
+export abstract class BaseWeapon {
+	abstract weaponName: string
+	/** 点击普攻：返回 true = 已消费本次点击 */
+	abstract normalAttack(now: number, ctx: AttackCtx): boolean
+	/** 按下左键开始蓄力：返回 true = SceneManager 冻结移动 */
+	abstract startCharge(now: number): boolean
+	/** 松开（编排层已算好 hold）：返回 true = 本次松开被武器消费 */
+	abstract heavyAttack(timeCharged: number, now: number): boolean
+	/** update 每帧轮询：蓄满是否立即停手并触发 heavyAttack */
+	abstract maxChargeReached(now: number): boolean
+	/** 武器视模型（剑 / 弓）切换挂载 */
+	abstract attach(camera: THREE.Camera): void
+	abstract setVisible(v: boolean): void
+	abstract dispose(): void
+	abstract updatePose(dt: number, now: number): void
 }
 ```
 
-- 统一结算入口（新增私有方法）：
-  - `applyDamageToZombie(z, dmg: DamageSource, by: MpPlayer, now)` —— 由现 `damageZombie` 改造（吼叫打断、易伤、击退、`dmg_z` 事件带 `sign`、吸血结算移入此处）。
-  - `applyDamageToPlayer(v, dmg: DamageSource, byPlayer, byZombie, now)` —— 现格挡评估（完美→`DamageSign.Blocked`；25% 失败→`DamageSign.Normal`）仍在这层，落血 + 荆棘反伤 + 吸血 + `dmg_p` 事件带 `sign` 收敛到现 `hurtPlayer`（签名改为接收 DamageSource）。
-  - `reflectDamage` 改为构造 `sign: DamageSign.Normal`、from=荆棘持有者的 DamageSource 复用同一落血函数。
-- 现有调用点全部改为「构造 DamageSource 再调入口」：
-  - `playerAttack` 三段（L439/L451 附近）、`tickWaves` 剑气命中（L415-416）、`damagePlayerByZombie`（L906 附近的僵尸普攻 10 伤）、横扫 / 突进 / 嘶吼路径。
-- 事件扩展：`dmg_z` / `dmg_p` 增加 `sign: DamageSign` 字段（`crit: boolean` 字段删除，由 `sign === DamageSign.Crit` 取代——PF messages.ts 同步）。
-- **僵尸体力扣除通道**（T2b 的挂点）：`useStamina(p, n, now)` 改签名为 `useStamina(target, dmg: DamageSource | { base, attacker }, now)` 或新增第三参 `attacker?: MpPlayer | MpZombie | null`——推荐后者：`n = base × attackerImpact / targetStability`（见 T2b）。所有 `useStamina` 调用点传入来源信息。
+- `PlayerCombat` 改造为**编排器**：持有 `weapon: BaseWeapon`（按快照 `setNet` 中 `mine.weapon` 切换实例）；保留共用状态（hp / 体力 / 眩晕 / 格挡 / chargeStart / chargeNotified / 飘字 / HUD）。
+- `SceneManager.ts` 调用点改造：
+  - L389 `beginCharge` → `combat.weapon.startCharge(now)`（剑 = 现 beginCharge 逻辑；返回 true 才 charging）
+  - L412-415 `fireWave` → `combat.weapon.heavyAttack(combat.chargeHold(now), now)`（剑内部判定未蓄满返回 false 回落普攻链）
+  - L424 `onLeftClick` → `combat.weapon.normalAttack(now, ctx)`
+  - `combat.update()` L405-410：每帧 `if (charging && weapon.maxChargeReached(now)) { charging = false; weapon.heavyAttack(chargeHold(now), now) }`（苍弓自动爆发挂点；剑恒 false 不触发）
+- `SwordWeapon`（双手剑）= 现逻辑平移：`normalAttack` = 反击 / 追击 / 空中戳刺 / 三段 / 缓冲连段（L254-303 + update L413-425 缓冲发放保留在编排器）；`startCharge` = 现 beginCharge；`heavyAttack` = 现 fireWave（SWING_CHASE 动画 + `wave` 上报）；`maxChargeReached` = false；视模型 = 现 buildSword + SWING_L/R/CHOP/THRUST/CHASE 关键帧 + ghosts。
 
-**PF `messages.ts` / 表现层**
-
-- `dmg_z` / `dmg_p` 类型同步 `sign: DamageSign`（PF 侧定义同构枚举）、删 `crit`。
-- 飘字按 sign 着色：`Crit`=暴击（大号橙红 + 放大）、`Heal`=治疗（绿 +「+」）、`Blocked`=格挡（灰「格挡」）、`Normal`=普通（现状白）。改 `combat.pushFloat` / `SceneManager.handleMpEvent` 飘字分支。
-
-**验收**：multi_smoke 现有 8 项全过；为数值正确性新增 2 个 smoke 断言用例（见 §五）。
+**验证**：build 通过 + 双开手测双手剑行为与现版本一致（三段 / 反击 / 追击 / 空中戳刺 / 蓄力剑气 / 连发）。
 
 ---
 
-### T2a 蓄力上限词条 + 重击公式
+### W4 苍弓 PB 裁决（依赖 W2）
 
-**语义（关键决策，见 §六 Q1）**：有效蓄力时长 `effHold = min(hold × chargeSpd, chargeMax)`；伤害 = `atk × 300% × effHold × dmgMul`。chargeSpd=1、hold=1 时 = 3×atk = 30，与现行 WAVE_DMG=30 基准一致。
+**`BowWeapon extends BaseWeapon`**
 
-**PB `world.ts`**
+- `normalAttack`（'shoot' 上报触发）：准星 3D 方向（复用 `waveDir()`）发射**球状闪电**：
+  - 新弹道类型 `Orb { owner, id, x/y/z, dx/dy/dz, target: string | null, tickAt, t }`，直线飞行 `ORB_SPEED`，无穿透（**首中即停**）；
+  - 命中判定复用现有采样：僵尸用 `Z_HIT_SAMPLES` 圆柱采样点到弹道距离 ≤ 0.55；玩家用中心点（y=1.0）距离 ≤ 0.6；撞墙 / 撞地 / TTL 到期消失（复用 `region()` 拦截 + y 边界逻辑）；
+  - 首次命中（僵尸或玩家）→ 停止前进并**附着目标**（`target` 记目标 key，之后跟随目标中心位置），每 `0.1s` 结算 `DamageSource { amount: 3, sign: Normal, impact: 1 }`（不掷暴击，见 Q1/Q7）；附着目标死亡或 **6 秒**（`ORB_TTL_S = 6`）到期 → 消失；
+  - 事件：`orb`（发射：by / id / x,y,z / dx,dy,dz）+ `orb_stop`（停止：id / x,y,z / 目标 key）；附着期间 tick 伤害走现有 `dmg_z` / `dmg_p` 事件（PF 飘字自动工作）。
+- `startCharge`（'charge_start'）：`p.chargeStartAt = now`（行动校验同 fireWave：眩晕 / 破防拒绝）。
+- `stopCharge`（'charge_stop'，提前松手）：清 `chargeStartAt`，激光停止，**无爆发**。
+- `heavyAttack(p, timeCharged, now)`：**爆发激光**——沿准星射线一次性 `DamageSource { amount: 40, impact: 11 }`（命中判定同下方射线，见 Q3），清 `chargeStartAt`；事件 `beam_burst`（by / x,y,z / dx,dy,dz，PF 播爆发特效）。
+- `maxChargeReached(p, now)`：`p.chargeStartAt >= 0 && now - p.chargeStartAt >= chargeDur(p)`（chargeDur = chargeMax / chargeSpd，与剑同公式）→ true，由 World tick 触发 `heavyAttack` + 停止。
+- `tick`（激光持续）：`chargeStartAt >= 0` 时每 `0.2s` 对**准星射线**上的目标结算 `DamageSource { amount: 15, impact: 3 }`（不掷暴击）：
+  - 射线命中判定（新私有函数 `beamHits(p, tx, ty, tz)`）：目标采样点到射线（原点 = 玩家位置，方向 = look3）垂距 ≤ 0.55（僵尸圆柱采样）/ ≤ 0.6（玩家 1.0 高中心），且沿射线正方向、距离 ≤ 20m；
+  - **穿透**：射线上所有命中目标都结算（Q3 待确认）；
+  - 被墙拦截：目标与发射者 region 跨界且隔门口墙（复用 `meleeCheck` L565 的隔墙判断）→ 不命中；
+  - 眩晕 / 死亡 / pickPhase → 由 World tick 侧中止蓄力（清 chargeStartAt）。
 
-- `fireWave(p, now, hold)`：
-  - `effHold = Math.min((hold ?? 1) * p.stats.chargeSpd, p.stats.chargeMax)`
-  - 剑气伤害改为 `p.stats.atk * 3 * effHold * p.stats.dmgMul`（现 `WAVE_DMG * atk/10 * dmgMul` 删除；`WAVE_DMG` 常量删除）
-  - 体力消耗 `useStamina(p, 10 * effHold, now)`（现 `10 * min(5, hold)` 的上限保护由 chargeMax 天然承担）
-- `tickWaves` 剑气伤害值同步改（或 fireWave 时把伤害存进 Wave 对象，tick 直接取——推荐后者，避免二次计算不一致）。
+**`world.ts` 集成**
+- `tick()`：Orb 弹道推进 `tickOrbs(dt, now)`（与 tickWaves 并列）；tick 玩家循环中眩晕 / 死亡时清 `chargeStartAt`（同 waveQueue L1190 的中止规则）。
+- `MpEvent` 增 `orb` / `orb_stop` / `beam_burst` 三个事件类型。
 
-**PF**
-
-- `combat.ts`：`chargeDur = 1/chargeSpd` 改为 `chargeDur = chargeMax / chargeSpd`（202 行附近 `mine.charge_dur` → 快照新增 `charge_max`）；HUD 蓄力进度公式不变（`hold/chargeDur`）。
-- `releaseCharge` 上报 hold 不设上限（PB 端钳制）——现 `Math.min(5, …)` 删除。
-- `messages.ts`：`NetPlayerState` 加 `charge_max`。
-
-**验收**：multi_smoke 新用例：hold=0.5 → 伤害 15×dmgMul；hold=2、chargeMax=1 → 伤害 30×dmgMul。
-
----
-
-### T2b 冲击力 / 稳定性
-
-**公式**：`扣除体力 = 基值 × 攻击者冲击力 / 受击者稳定性`；无攻击者 → 冲击力按 100%。僵尸无词条：攻击者/受击者为僵尸时恒 1。
-
-**PB `world.ts`**
-
-- `useStamina(target, base, now, attacker?)`（attacker: `MpPlayer | MpZombie | null`）：
-  - `const ai = attacker && 'stats' in attacker ? attacker.stats.impact : 1`
-  - `const tv = 'stats' in target ? target.stats.stability : 1`
-  - `n = base × ai / tv`
-- 全部调用点传入攻击者（约 12 处）：
-  - 剑气命中玩家（L639/660/664/669）→ attacker = 发射者
-  - 完美格挡反噬玩家攻击者（L648，SWEEP/ROAR 反噬 933/996）→ attacker = 攻击方
-  - 僵尸普攻/横扫/嘶吼命中玩家 → attacker = 僵尸（impact 恒 1）
-  - 玩家攻击扣僵尸体力 `spendZ`（L908/938/983）→ attacker = 玩家，target=僵尸（双方恒 1，数值不变但通道打通）
-  - `fireWave` 自扣（L359）→ attacker = null（100%）
-- `applyDamageToPlayer` 内部统一走该签名（impact 取 DamageSource.impact）。
-
-**PF**：仅快照字段 `impact` / `stability` 下发（HUD 可选展示，本次不加 UI）。
-
-**验收**：multi_smoke 新用例：impact=1.5 的玩家攻击 → 僵尸扣体力 = 基值×1.5。
+**验收**：multi_smoke 新增断言（见 §四）。
 
 ---
 
-### T2c 暴击率 / 暴击伤害
+### W5 苍弓 PF 表现（依赖 W1/W3/W4 协议与事件定稿）
 
-**公式**：掷点 `Math.random() < critRate` → `sign: DamageSign.Crit`，`amount = base × (1 + critDmg)`。初始 5% / 100%。
+**`combat.ts` / 新文件 `bow.ts`**
+- `BowWeapon` 视图实现：`buildBow()` 弓视模型（simple 几何合成，同 buildSword 风格，挂相机）；姿态关键帧：待机持弓 / 蓄力拉弓（准星蓄力环 `hud.charge` 复用）/ 射球松弦 / 爆发后摆。
+- `normalAttack`：射球动画（拉弓关键帧短放）+ `sendMpAction({ kind: 'shoot' })` + 音效；**无目标也射**（远程武器），交互优先级保持：复活尸体 → 场景交互物 → 射球（不吞台灯 / 开门）。
+- `startCharge`：拉弓姿态 + `sendMpAction({ kind: 'charge_start' })`；`currentAnimTag` 蓄力中返回 `'beam'`（远端渲染挂点，方向走 mp_input dir3 已有）。
+- `heavyAttack`：蓄满松手 → 若未达蓄满且非自动触发则等同 stopCharge（`charge_stop`）；爆发由 **PB `beam_burst` 事件**驱动本地特效（避免双端双重触发）+ `beam_stop`。
+- `maxChargeReached`：本地镜像 `hold >= chargeDur` → true（编排层自动停手；爆发特效仍等 PB 事件，双保险防视觉漂移）。
 
-**PB `world.ts`**
+**`SceneManager.ts`**
+- 事件渲染：`orb`（发光球体 + 拖尾飞行，同 wavesVis 管理）、`orb_stop`（附着点闪烁小球，目标跟随）、`beam_burst`（粗光束闪光 0.3s + 屏幕微震）；持续激光：本地 `weapon` 为弓且 charging → 从相机沿准星渲染细光束圆柱；远端玩家 `anim === 'beam'` → 按其快照位置 + dir3 渲染光束。
+- `RemotePlayers.ts`：`weapon` 快照字段 → 远端玩家切换武器渲染（弓为简模或暂用隐藏剑 + 蓄力姿态，Q8 可确认）。
 
-- 暴击掷点位置：`playerAttack` 三段与 `fireWave`（构造 DamageSource 时）；**荆棘反伤 / 僵尸攻击不暴击**（僵尸无词条，天然不触发）。
-- `dmg_z`/`dmg_p` 的 `sign` 已由 T3 携带，本任务仅加掷点逻辑。
+**`audio.ts`**
+- `SfxName` 增 `'orbShot' | 'beamLoop' | 'beamBurst'`。项目音效均为静态资源——**建议用 WebAudio 合成**（振荡器 + 包络，无资源依赖）实现，避免等音频文件；若你提供 mp3 资源则改为静态导入（见 Q6）。
 
-**PF**
-
-- 飘字暴击样式（T3 已铺好，本任务联调样式）。
-- 快照 `crit_rate` / `crit_dmg`（HUD 可选）。
-
-**验收**：smoke 无法断言随机暴击——multi_smoke 连续攻击 30 次断言至少出现一次 `sign === DamageSign.Crit`（统计性断言）。
-
----
-
-### T5 三选一池扩展（依赖 T1/T2 全部就绪）
-
-**PB `world.ts`**：`PICK_OPTIONS` 由 `string[]` 改为 `{ label: string; key: StatKey; add: number }[]`（表驱动），`applyPicks` 变查表：
-
-- 特殊项保留定制逻辑：`maxHp`/`maxSt` 按百分比回补当前值；`parryPct`/`dmgMul`/百分比项 ×100 取整防浮漂。
-- 新增档位建议（**待确认，见 §六 Q3**）：
-  `蓄力上限 +0.25s`、`冲击力 +15%`、`稳定性 +15%`、`暴击率 +5%`、`暴击伤害 +25%`
-- `protocol.ts` idx 上限同步 `max(N-1)`。
-
-**PF**：`BuffPickModal.vue` LABELS 追加对应文案（索引对齐）。
+**验收**：build 通过 + 双开手测清单（§四）。
 
 ---
 
-### T4 闪避 Bug 修复（独立）
+### W6 集成验证与回归
 
-**根因（已定位）**：`tryDash` 把 `vel` 设为 8.5 m/s，但渲染循环每帧的水平**软上限**把速度钳回 `maxSpeed = 3.0`（`SceneManager.ts` L953-958），闪避瞬间被掐灭，视觉等于没触发。
-
-**修复（`SceneManager.ts`）**
-
-- 新增 `dashFreeUntil`：`tryDash` 成功时 `= now + 0.25`；软上限判断改为 `if (hSpeed > maxSpeed && now > this.dashFreeUntil)`。
-- 同时修时序边角：`keys.add(e.code)` 移到 Shift 分支**之前**（当前在 L869，Shift 同帧早于方向键按下时 keys 还没有方向）。
-
-**验收**：手动测试（Shift+W 明显位移 + dash 音效）；构建通过。
-
----
-
-### T6 空中戳刺（独立，排 T3 后）
-
-**PB `world.ts`（改动很小）**
-
-- `playerAttack` 删除 `airMul`（L433-434 与 L439 引用）——空中左键就是一次普通近战裁决（PB 已按 `findMeleeTarget` 找最近敌人）。
-- 空中重击：现流程已支持（蓄力→wave），无特殊动作，不改。
-
-**PF（主要工作量）**
-
-- `combat.ts`：
-  - 左键按下时若处于空中（`!onGround`，用相机高度 / vy 判断，`SceneManager` 提供查询或回调）且非蓄力 → **空中戳刺**：目标池 = 存活 `NetZombie` + `remotePlayers.centers()`，取最近且 ≤ 3.4m 者；有目标：播放戳刺动画（复用现成 `SWING_THRUST`）+ 上报 `attack segment 0`（PB 正常裁决）+ 通知 SceneManager 做摄像机 lerp；无目标在 3.4m 内 → 普通挥砍。
-  - `anim` 标签新增 `'stab'`，携带俯仰：`stab|<pitch>`（如 `stab|0.62`，pitch = 顶面法向量俯仰角弧度）。
-- `SceneManager.ts`：
-  - 摄像机 3D lerp：新增 `stabLerp = { quat: Quaternion, until }` 状态，期间 `lockCtl.pointerSpeed = 0` 并每帧 `camera.quaternion.slerp(目标四元数, min(1, dt*10))`；结束（落地或 0.4s）恢复 pointerSpeed=1。**注意 PointerLockControls 直接写 camera.rotation，slerp 期间必须压掉其输入**（已验证其有 pointerSpeed 属性可控）。
-  - `sendMpInput` 的 `anim` 字段透传 `stab|pitch` 格式。
-- `RemotePlayers.ts`：
-  - 解析 `stab|pitch`：播放戳刺手臂动作，同时整个玩家 group 从直立 slerp 到「顶面法向量指向 (yaw 水平角, pitch 俯仰)」的倾斜姿态（用四元数 `setFromUnitVectors(+Y, dir)`），动画期结束 slerp 回直立。死亡倒地（rotation.z）与 stab 互斥，不冲突。
-- `messages.ts`：`anim` 仍为 string，无结构变更。
-
-**验收**：构建通过 + 双开浏览器手测：空中左键镜头转向目标、其他窗口可见圆柱体倾斜指向目标；空中重击正常出剑气。
+- 全量：pb `bunx tsc --noEmit` + `bun run smoke` + `bun scripts/multi_smoke.ts`；pf `npm run build`。
+- multi_smoke 新增用例：
+  1. 苍弓普攻：发射 orb → 飞行命中僵尸 → 停止 + 0.1s × N tick 断言每 tick 3 伤、impact 1 扣体；
+  2. 激光：charge_start → 0.2s × N tick 断言每 tick 15 伤（穿透双目标断言，视 Q3）；
+  3. 蓄满自动爆发：charge_start 后推进时间 ≥ chargeDur → 断言 40 伤一次 + `chargeStartAt` 清空 + 后续无 tick；
+  4. 提前松手：charge_stop → 无爆发无 tick；
+  5. 切武器：weapon action → 快照 weapon 变化 + 弓普攻不再触发三段连击裁决。
+- 手测清单：Q/E 切换武器（上一把/下一把）、弓普攻射球（命中停止 + 持续伤害飘字 + 6s 后消失）、按住激光（松手停 / 蓄满自动爆发停）、双手剑全行为回归、远端玩家激光 / 弓渲染。
 
 ---
 
-### T7 重启 PB 按钮（独立）
-
-**现状**：PB 单进程（`index.ts`）同时服务 `/ws/scb`、`/ws/pf`、`/api/state`；SCB（智能家居本体）是连接 `/ws/scb` 的**外部客户端**。「仅重启 PB」= 重启该 Bun 进程；PF 已有断线自动重连（指数退避，client.ts）。
-
-**方案（PB 自接管重启，无外部依赖）**
-
-1. `protocol.ts`：PF 载荷新增 `admin_restart`（空对象）；PB 事件新增广播 `admin_restarting`。
-2. `index.ts`：
-   - 收到 `admin_restart` → 向所有连接广播 `admin_restarting` → 300ms 后 `Bun.spawn([process.execPath, 'src/index.ts'], { env: { ...process.env, PB_TAKEOVER_PORT: String(PORT) }, stdio: ['ignore','inherit','inherit'] })` → `process.exit(0)`。
-   - 启动时若存在 `PB_TAKEOVER_PORT`：listen 失败（EADDRINUSE）则重试（200ms × 最多 60 次）。
-3. `StatusBar.vue`：红色「重启服务器」按钮 + **二次确认**（首次点击变「确认重启？」，3s 未确认还原），确认后 `pbClient.send({ type: 'admin_restart', ... })`；收 `admin_restarting` → conn store 置提示态「PB 重启中」。
-4. `client.ts`：`admin_restarting` 消息分发（onMpEvent 之外的通知通道或复用现有 message 回调链）。
-
-**已知影响（写入实现注释与 UI 提示）**：PB 内存中的设备状态机随进程重置为初始快照，SCB 重连后以其实际状态重新同步；SCB 若无自动重连需其自身支持（不属于本次改动范围）。
-
-**备选方案 B**（若 spawn detached 在 Windows 上不稳）：PB 暴露 `POST /api/restart` → `process.exit(0)`，依赖 `bun --watch` 拉起；作为降级路径。
-
----
-
-## 三、协议字段汇总（PB protocol.ts ↔ PF messages.ts 必须成对改）
+## 三、协议字段汇总（PB protocol.ts ↔ PF messages.ts 成对改）
 
 | 位置 | 变更 |
 |---|---|
-| `dmg_z` / `dmg_p` 事件 | +`sign`，−`crit` |
-| 快照 players | +`charge_max`、`impact`、`stability`、`crit_rate`、`crit_dmg` |
-| mp_input.anim | 值域新增 `stab\|<pitch>`（仍为 string） |
-| PF 载荷 | +`admin_restart`；广播 +`admin_restarting` |
-| mp_action pick | idx max 更新为新池长度−1 |
+| `mp_action.kind` | +`'weapon' / 'shoot' / 'charge_start' / 'charge_stop'` |
+| `mp_action.weapon` | 新增可选字段 `z.enum(['sword','bow'])`（weapon 专用） |
+| 快照 players | +`weapon: 'sword' \| 'bow'` |
+| MpEvent | +`orb` / `orb_stop` / `beam_burst` |
+| mp_input.anim | 值域新增 `'beam'`（仍为 string，远端激光渲染挂点） |
 
 ---
 
 ## 四、验证计划
 
-1. 每任务：`bunx tsc --noEmit` → `bun run smoke`（12 项）→ `bun scripts/multi_smoke.ts`（8 项）→ `npm run build`。
-2. multi_smoke 新增用例（随 T2/T3 一起加）：
-   - 蓄力伤害：hold=0.5 / hold=2（钳到 chargeMax）两个断言
-   - 冲击力：改 impact 后断言僵尸扣体量
-   - 暴击：30 次攻击至少 1 次 `sign === DamageSign.Crit`（统计性断言）
-3. 人工手测清单：闪避位移、空中戳刺（含远端圆柱倾斜）、重启按钮（双浏览器在线时一台点重启、另一台自动恢复）。
+见各任务验收 + W6 汇总。每任务四件套：pb tsc / smoke（12）/ multi_smoke / pf build；W4 起新增 5 个 multi_smoke 断言用例。
 
 ## 五、风险与注意
 
-- T1 是大面积机械替换（40+ 处），靠 tsc 兜底，单独提交便于回溯。
-- T3 动了所有伤害路径，务必在 T3 落地后先全量回归再加新词条，避免「重构 + 新功能」混在一个不可 bisect 的提交里。
-- 蓄力体力消耗公式变化（10×effHold）会改变手感（原 1s 蓄力扣 10，现在一样；但 chargeSpd>1 时 effHold 变大扣得更多）——语义上「更快蓄满=更贵」，合理。
-- 重启按钮是运维性质破坏性操作，二次确认 + 仅 PF 通道可发（SCB 通道 schema 不含 admin_restart，天然隔离）。
+- **W2/W3 是双端行为等价重构**，务必单独完成并全量回归后再动 W4/W5，避免「重构 + 新功能」混在一个不可 bisect 的提交里。
+- `combat.ts` 编排层改动大（onLeftClick / beginCharge / fireWave 调用点全部改为武器生命周期回调），SceneManager 调用点同步改，注意短按普攻回落链（未蓄满 → 普攻）语义保留在编排层而非武器内部。
+- 激光射线判定是新几何函数（射线-点垂距），与剑气扇形（waveHit）互不复用；隔墙拦截复用 meleeCheck L565 判断。
+- 苍弓 tick 伤害高频（球 10Hz / 激光 5Hz）→ dmg_z / dmg_p 事件量增大，PF 飘字有投影节流，需手测确认不刷屏（必要时飘字合并）。
+- atk 词条对苍弓固定伤害无效（见 Q1），三选一 atk 档位对弓玩家贬值——plan 建议苍弓伤害 × dmgMul 联动全局伤害词条缓解。
 
 ## 六、待确认决策点
 
-- **Q1 蓄力公式**：我按 `effHold = min(hold × chargeSpd, chargeMax)` 设计（chargeSpd 语义 = 加速蓄满，与现有「蓄力速度+15%」兼容）。若你想要「chargeSpd 完全废弃 / 或蓄力时间就是裸按住秒数」，请指出。
-- **Q2 空中戳刺的暴击/荆棘**：戳刺即普通近战攻击，走同一伤害管线（可暴击、可触发荆棘吸血），无特殊倍率——确认无误？
-- **Q3 新词条入池档位**：§T5 的 5 个建议档位（蓄力上限+0.25s / 冲击力+15% / 稳定性+15% / 暴击率+5% / 暴伤+25%）是否照此入池？池子将到 15 项。
-- **Q4 重启影响**：设备状态在 PB 内存中，重启后回初始快照（SCB 重连后重同步）。可接受？
+- **Q1 苍弓伤害是否吃词条**：todo 字面为固定值（球 3 / 激光 15 / 爆发 40）。我建议：固定基值 × `dmgMul`（吃全局伤害倍率，不吃 atk）；备选：随 atk 缩放（基值 × atk/10）。
+- **Q2 球状闪电停止后的行为**：字面「停止前进」，持续时间 6 秒已确认。我建议**附着命中目标**（跟随目标移动持续 0.1s/3 伤，目标死亡或 6s 到期后消失）；备选：停在命中点原地 tick（目标走开即空转）。
+- **Q3 激光命中**：我建议**穿透**（射线上所有目标都结算）+ 被室内外墙拦截；备选：只打最近一个目标。
+- **Q4 激光按住时移速**：沿用现蓄力减速 50%（chargeSlow）；备选：完全冻结移动。
+- **Q5 弓的体力消耗**：todo 未提。我建议弓重击**不耗体力**（激光高频扣血已是代价）；备选：对齐剑气 10×effHold 一次结算。
+- **Q6 苍弓音效**：WebAudio 合成（无需音频文件）还是你提供 mp3 资源走静态导入？
+- **Q7 弓是否暴击 / 吃吸血**：我建议 tick 类伤害（球 / 激光）**不掷暴击**（否则 0.1s/3 伤×2.0 暴击过于滚雪球），但**吃吸血**（走统一 DamageSource 结算，天然生效）；爆发 40 可掷暴击。可改。
+- **Q8 远端玩家武器渲染精度**：弓视模型是完整新模型，还是先复用简化占位（隐藏剑 + 姿态标签）？影响 W5 工作量。

@@ -19,7 +19,7 @@
 import * as THREE from 'three'
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js'
 import { PointerLockControls } from 'three/examples/jsm/controls/PointerLockControls.js'
-import { playSfx } from './audio'
+import { playSfx, setBeamLoop } from './audio'
 import type {
 	Action,
 	DeviceId,
@@ -30,7 +30,7 @@ import type {
 	ZNetState,
 } from '../protocol/messages'
 import { pbClient } from '../ws/client'
-import { PlayerCombat, type CombatHud, type FloatKind } from './combat'
+import { PlayerCombat, WEAPON_NAMES, type CombatHud, type FloatKind } from './combat'
 import { buildDevices, type DeviceRigs } from './devices'
 import { buildRoom, type RoomRig } from './room'
 import { RemotePlayers } from './RemotePlayers'
@@ -103,6 +103,14 @@ const MP_INPUT_PERIOD = 0.1   // 联机输入上报周期 s（10Hz）
 // 剑气面内挥摆复用对象（避免每帧分配，见 updateWaves）
 const _waveSwingQ = new THREE.Quaternion()
 const _waveZAxis = new THREE.Vector3(0, 0, 1)
+
+// 苍弓（与 PB world.ts 对齐的视觉参数）
+const ORB_SPEED = 16        // 球状闪电飞行速度 m/s（与 PB ORB_SPEED 一致）
+const ORB_FALLBACK_TTL = 8  // orb 视觉兜底寿命 s（正常由 orb_stop 事件驱动消失）
+const BEAM_RANGE = 20       // 激光长度 m（与 PB BEAM_RANGE 一致）
+const BEAM_BURST_S = 0.3    // 爆发光束闪光时长 s
+const _beamDir = new THREE.Vector3()
+const _beamUp = new THREE.Vector3(0, 1, 0)
 
 export class SceneManager {
 	private renderer: THREE.WebGLRenderer
@@ -318,6 +326,23 @@ export class SceneManager {
 			w.mat.dispose()
 		}
 		this.wavesVis.length = 0
+		for (const id of [...this.orbsVis.keys()]) this.removeOrb(id)
+		for (const b of this.burstBeams) {
+			b.mesh.removeFromParent()
+			b.geo.dispose()
+			b.mat.dispose()
+		}
+		this.burstBeams.length = 0
+		if (this.beamMesh) {
+			this.beamMesh.removeFromParent()
+			this.beamGeo?.dispose()
+			this.beamMat?.dispose()
+			this.beamMesh = null
+		}
+		this.orbHaloTex?.dispose()
+		this.orbHaloTex = null
+		this.beamLoopOn = false
+		setBeamLoop(false)
 		pbClient.onWorld = undefined
 		pbClient.onMpEvent = undefined
 		if (this.pendingPerfect !== null) window.clearTimeout(this.pendingPerfect)
@@ -386,7 +411,7 @@ export class SceneManager {
 		if (e.button !== 0) return
 		this.pointerDownPos = { x: e.clientX, y: e.clientY }
 		// 第一人称锁定：按下左键开始蓄力重击（松开判定：<1s 普攻，≥1s 剑气）
-		if (this.mode === 'walk' && this.lockCtl.isLocked && this.combat.beginCharge(this.lastTime)) {
+		if (this.mode === 'walk' && this.lockCtl.isLocked && this.combat.startCharge(this.lastTime)) {
 			this.charging = true
 		}
 	}
@@ -411,8 +436,8 @@ export class SceneManager {
 		if (this.mode === 'walk' && this.lockCtl.isLocked) {
 			if (this.charging) {
 				this.charging = false
-				// fireWave 内部校验蓄满时长（不满自动清状态返回 false）
-				if (this.combat.fireWave(this.lastTime)) return
+				// 武器结算重击（剑未蓄满自动回落 false；蓄满停手已由 maxChargeReached 自动触发）
+				if (this.combat.heavyAttack(this.combat.chargeHold(this.lastTime), this.lastTime)) return
 			}
 			// 队友复活：准星指向 3m 内的尸体 → revive 意图（优先于攻击 / 交互）
 			const corpse = this.pickCorpse()
@@ -421,12 +446,14 @@ export class SceneManager {
 				this.onToast?.(`正在复活 ${corpse.name}`)
 				return
 			}
-			const consumed = this.combat.onLeftClick(
+			// 交互物先拾取（远程武器不吞台灯 / 开门：经 ctx 传入武器判断）
+			const tag = this.pickInteractable()
+			const consumed = this.combat.normalAttack(
 				this.lastTime, this.zombies, this.remotePlayers.centers(), this.camera,
 				!this.flying && this.camera.position.y <= EYE_HEIGHT + 1e-4,
+				tag,
 			)
 			if (consumed) return
-			const tag = this.pickInteractable()
 			if (tag) {
 				this.interact(tag)
 				return
@@ -571,6 +598,29 @@ export class SceneManager {
 	private waveTex: THREE.CanvasTexture | null = null
 	private wavesVis: { mesh: THREE.Group; geo: THREE.PlaneGeometry; mat: THREE.MeshBasicMaterial; pos: THREE.Vector3; dir: THREE.Vector3; t: number; quat: THREE.Quaternion }[] = []
 
+	// ---- 苍弓视觉：球状闪电 / 爆发光束 / 本地持续激光 ----
+	/** 飞行 / 附着中的球状闪电（orb / orb_stop 事件驱动） */
+	private orbsVis = new Map<number, {
+		group: THREE.Group
+		core: THREE.Mesh
+		coreMat: THREE.MeshBasicMaterial
+		halo: THREE.Sprite
+		pos: THREE.Vector3
+		dir: THREE.Vector3
+		target: string | null
+		t: number
+	}>()
+	private orbHaloTex: THREE.CanvasTexture | null = null
+	/** 爆发光束闪光（beam_burst 事件，0.3s 淡出） */
+	private burstBeams: { mesh: THREE.Mesh; geo: THREE.CylinderGeometry; mat: THREE.MeshBasicMaterial; t: number }[] = []
+	/** 本地持续激光细束（蓄力态驱动渲染，单实例复用） */
+	private beamMesh: THREE.Mesh | null = null
+	private beamGeo: THREE.CylinderGeometry | null = null
+	private beamMat: THREE.MeshBasicMaterial | null = null
+	private beamLoopOn = false
+	/** 爆发屏幕微震（FOV 脉冲，仅发射者自己） */
+	private fovKick = 0
+
 	private getWaveTex(): THREE.CanvasTexture {
 		if (this.waveTex) return this.waveTex
 		const c = document.createElement('canvas')
@@ -644,6 +694,150 @@ export class SceneManager {
 			w.mesh.quaternion.copy(w.quat).multiply(_waveSwingQ.setFromAxisAngle(_waveZAxis, Math.sin(w.t * 14) * 0.12))
 			w.mat.opacity = Math.max(0, 0.95 * (1 - (w.t / 1.2) ** 3))
 		}
+	}
+
+	// ---------------- 苍弓视觉（PB 事件驱动 + 蓄力态驱动） ----------------
+
+	/** 球状闪电光晕贴图（径向渐变，缓存） */
+	private getOrbHaloTex(): THREE.CanvasTexture {
+		if (this.orbHaloTex) return this.orbHaloTex
+		const c = document.createElement('canvas')
+		c.width = c.height = 64
+		const ctx = c.getContext('2d')!
+		const g = ctx.createRadialGradient(32, 32, 2, 32, 32, 30)
+		g.addColorStop(0, 'rgba(200, 255, 252, 1)')
+		g.addColorStop(0.35, 'rgba(110, 230, 255, 0.55)')
+		g.addColorStop(1, 'rgba(110, 160, 255, 0)')
+		ctx.fillStyle = g
+		ctx.fillRect(0, 0, 64, 64)
+		const tex = new THREE.CanvasTexture(c)
+		tex.colorSpace = THREE.SRGBColorSpace
+		this.orbHaloTex = tex
+		return tex
+	}
+
+	/** 生成球状闪电实体（orb 事件到达时调用，含发射者自己）：飞行 16 m/s 与 PB 同速 */
+	private spawnOrb(x: number, y: number, z: number, dx: number, dy: number, dz: number, id: number) {
+		playSfx('orbShot')
+		const geo = new THREE.SphereGeometry(0.14, 12, 10)
+		const mat = new THREE.MeshBasicMaterial({
+			color: 0x7df9ff, transparent: true, opacity: 0.95,
+			blending: THREE.AdditiveBlending, depthWrite: false,
+		})
+		const core = new THREE.Mesh(geo, mat)
+		const halo = new THREE.Sprite(new THREE.SpriteMaterial({
+			map: this.getOrbHaloTex(), transparent: true, opacity: 0.9,
+			blending: THREE.AdditiveBlending, depthWrite: false,
+		}))
+		halo.scale.setScalar(0.55)
+		const group = new THREE.Group()
+		group.add(core)
+		group.add(halo)
+		group.position.set(x, y, z)
+		this.scene.add(group)
+		this.orbsVis.set(id, {
+			group, core, coreMat: mat, halo,
+			pos: new THREE.Vector3(x, y, z),
+			dir: new THREE.Vector3(dx, dy, dz).normalize(),
+			target: null, t: 0,
+		})
+	}
+
+	/** 附着目标世界中心（'z<id>' = 僵尸胸口 / 玩家 uuid = 圆柱中心 1.0m） */
+	private orbTargetCenter(target: string): THREE.Vector3 | null {
+		if (target.startsWith('z')) {
+			const z = this.zombies.find((x) => x.id === Number(target.slice(1)))
+			return z ? z.centerPos : null
+		}
+		const c = this.remotePlayers.centers().find((c) => c.uuid === target)
+		return c ? new THREE.Vector3(c.x, c.y, c.z) : null
+	}
+
+	private removeOrb(id: number) {
+		const o = this.orbsVis.get(id)
+		if (!o) return
+		this.orbsVis.delete(id)
+		o.group.removeFromParent()
+		o.core.geometry.dispose()
+		o.coreMat.dispose()
+		; (o.halo.material as THREE.SpriteMaterial).dispose()
+	}
+
+	private updateOrbs(dt: number) {
+		for (const [id, o] of this.orbsVis) {
+			o.t += dt
+			if (o.t > ORB_FALLBACK_TTL) {
+				this.removeOrb(id)
+				continue
+			}
+			if (o.target === null) {
+				o.pos.addScaledVector(o.dir, ORB_SPEED * dt)
+			} else {
+				const c = this.orbTargetCenter(o.target)
+				if (c) o.pos.lerp(c, Math.min(1, dt * 20)) // 附着跟随（插值平滑）
+			}
+			o.group.position.copy(o.pos)
+			// 脉动 + 缩放（附着后缩小、闪烁加快）
+			const pulse = 1 + Math.sin(o.t * (o.target ? 34 : 22)) * 0.15
+			o.core.scale.setScalar((o.target ? 0.75 : 1) * pulse)
+			o.halo.scale.setScalar((o.target ? 0.42 : 0.55) * pulse)
+		}
+	}
+
+	/** 爆发光束（beam_burst 事件）：粗光束沿弹道 0.3s 闪光淡出 */
+	private spawnBurstBeam(x: number, y: number, z: number, dx: number, dy: number, dz: number) {
+		const geo = new THREE.CylinderGeometry(0.14, 0.14, BEAM_RANGE, 10, 1, true)
+		const mat = new THREE.MeshBasicMaterial({
+			color: 0xbffcff, transparent: true, opacity: 1,
+			blending: THREE.AdditiveBlending, depthWrite: false,
+		})
+		const mesh = new THREE.Mesh(geo, mat)
+		const dir = new THREE.Vector3(dx, dy, dz).normalize()
+		mesh.position.set(x, y, z).addScaledVector(dir, BEAM_RANGE / 2)
+		mesh.quaternion.setFromUnitVectors(_beamUp, dir)
+		this.scene.add(mesh)
+		this.burstBeams.push({ mesh, geo, mat, t: 0 })
+	}
+
+	private updateBurstBeams(dt: number) {
+		for (let i = this.burstBeams.length - 1; i >= 0; i--) {
+			const b = this.burstBeams[i]
+			b.t += dt
+			if (b.t >= BEAM_BURST_S) {
+				b.mesh.removeFromParent()
+				b.geo.dispose()
+				b.mat.dispose()
+				this.burstBeams.splice(i, 1)
+				continue
+			}
+			const x = b.t / BEAM_BURST_S
+			b.mat.opacity = 1 - x
+			b.mesh.scale.set(1 + x * 1.2, 1, 1 + x * 1.2)
+		}
+	}
+
+	/** 本地持续激光细束（弓蓄力态驱动：从相机沿准星渲染，粗细 / 亮度随蓄力增强） */
+	private updateLocalBeam() {
+		if (!this.beamMesh) {
+			this.beamGeo = new THREE.CylinderGeometry(1, 1, 1, 8, 1, true)
+			this.beamMat = new THREE.MeshBasicMaterial({
+				color: 0x9be8ff, transparent: true, opacity: 0.35,
+				blending: THREE.AdditiveBlending, depthWrite: false,
+			})
+			this.beamMesh = new THREE.Mesh(this.beamGeo, this.beamMat)
+			this.beamMesh.visible = false
+			this.scene.add(this.beamMesh)
+		}
+		const active = this.mode === 'walk' && this.combat.weaponId === 'bow' && this.combat.chargeStart >= 0
+		this.beamMesh.visible = active
+		if (!active) return
+		const charge01 = Math.min(1, this.combat.chargeHold(this.lastTime) / this.combat.chargeDur)
+		this.camera.getWorldDirection(_beamDir)
+		const r = 0.035 + charge01 * 0.045
+		this.beamMesh.scale.set(r, BEAM_RANGE, r)
+		this.beamMesh.position.copy(this.camera.position).addScaledVector(_beamDir, BEAM_RANGE / 2 + 0.3)
+		this.beamMesh.quaternion.setFromUnitVectors(_beamUp, _beamDir)
+		this.beamMat!.opacity = 0.28 + charge01 * 0.35
 	}
 
 	/** world 快照应用：远程玩家增删 / 僵尸状态机渲染 / 自己的权威数值 */
@@ -763,6 +957,30 @@ export class SceneManager {
 				this.spawnWave(e.x, e.y, e.z, e.dx, e.dy, e.dz, e.roll)
 				break
 			}
+			case 'orb': {
+				// 苍弓射球：各端本地渲染飞行视觉（伤害由 PB 裁决）
+				this.spawnOrb(e.x, e.y, e.z, e.dx, e.dy, e.dz, e.id)
+				break
+			}
+			case 'orb_stop': {
+				// 球状闪电停止前进：附着目标跟随 / null 消失
+				const o = this.orbsVis.get(e.id)
+				if (!o) break
+				if (e.target === null) this.removeOrb(e.id)
+				else o.target = e.target
+				break
+			}
+			case 'beam_burst': {
+				// 苍弓蓄满爆发：粗光束闪光（伤害由 PB 射线裁决）
+				this.spawnBurstBeam(e.x, e.y, e.z, e.dx, e.dy, e.dz)
+				playSfx('beamBurst')
+				if (e.by === me) {
+					// 发射者自己：屏幕微震 + 强制对齐本地蓄力态（PB tick 先于本地镜像的边缘时序）
+					if (this.combat.chargeStart >= 0) this.combat.chargeStart = -1
+					this.fovKick = BEAM_BURST_S
+				}
+				break
+			}
 			case 'parry': {
 				if (e.uuid !== me) break
 				if (e.fail) {
@@ -877,6 +1095,13 @@ export class SceneManager {
 					this.vel.y = JUMP_IMPULSE
 				}
 			}
+		}
+		// 第一人称锁定时 Q / E 切换上一把 / 下一把武器（蓄力中不可切换，PB 快照回写为准）
+		if ((e.code === 'KeyQ' || e.code === 'KeyE') && !e.repeat && this.mode === 'walk' && this.lockCtl.isLocked && !this.charging) {
+			const target = this.combat.cycleWeapon(e.code === 'KeyE' ? 1 : -1)
+			pbClient.sendMpAction({ kind: 'weapon', weapon: target })
+			this.onToast?.(`切换武器：${WEAPON_NAMES[target]}`)
+			return
 		}
 		this.keys.add(e.code)
 		// 第一人称下 Shift → 朝 WSAD 按住的方向闪避（爆发速度 + dash 音效）
@@ -1002,8 +1227,9 @@ export class SceneManager {
 		p.x += this.vel.x * dt
 		p.z += this.vel.z * dt
 
-		// 疾跑视场角动态变化（速度感）
-		const targetFov = this.sprinting ? FOV_SPRINT : 60
+		// 疾跑视场角动态变化（速度感）+ 爆发微震（FOV 脉冲）
+		const targetFov = (this.sprinting ? FOV_SPRINT : 60)
+			+ (this.fovKick > 0 ? Math.sin((1 - this.fovKick / BEAM_BURST_S) * Math.PI) * 3.5 : 0)
 		if (Math.abs(this.camera.fov - targetFov) > 0.01) {
 			this.camera.fov += (targetFov - this.camera.fov) * Math.min(1, dt * 8)
 			this.camera.updateProjectionMatrix()
@@ -1121,6 +1347,16 @@ export class SceneManager {
 		// 远程玩家与僵尸插值渲染（固定视角下同样可见）
 		this.remotePlayers.update(dt)
 		this.updateWaves(dt)
+		this.updateOrbs(dt)
+		this.updateBurstBeams(dt)
+		this.updateLocalBeam()
+		// 持续激光循环音状态沿（弓蓄力期间开启）
+		const wantBeamLoop = this.mode === 'walk' && this.combat.weaponId === 'bow' && this.combat.chargeStart >= 0
+		if (wantBeamLoop !== this.beamLoopOn) {
+			this.beamLoopOn = wantBeamLoop
+			setBeamLoop(wantBeamLoop)
+		}
+		if (this.fovKick > 0) this.fovKick = Math.max(0, this.fovKick - dt)
 		for (const z of this.zombies) z.update(dt, time)
 		for (let i = this.zombies.length - 1; i >= 0; i--) {
 			if (this.zombies[i].removeMe) {

@@ -233,10 +233,13 @@ export const MpInputPayloadSchema = z
 	.strict()
 export type MpInputPayload = z.infer<typeof MpInputPayloadSchema>
 
-/** PF 动作意图：攻击 / 格挡 / 请求复活 / 剑气 / 三选一 / 队友复活 / 台灯召唤 */
+/** PF 动作意图：攻击 / 格挡 / 请求复活 / 剑气 / 三选一 / 队友复活 / 台灯召唤 / 武器切换 */
 export const MpActionPayloadSchema = z
 	.object({
-		kind: z.enum(['attack', 'parry_start', 'parry_stop', 'respawn', 'wave', 'pick', 'revive', 'lamp']),
+		kind: z.enum([
+			'attack', 'parry_start', 'parry_stop', 'respawn', 'wave', 'pick', 'revive', 'lamp',
+			'weapon', 'shoot', 'charge_start', 'charge_stop',
+		]),
 		segment: z.number().int().min(0).max(3).optional(),
 		/** wave 专用：蓄力时长 s（PB 按每秒 10 体力结算消耗） */
 		hold: z.number().min(0).max(10).optional(),
@@ -244,6 +247,8 @@ export const MpActionPayloadSchema = z
 		idx: z.number().int().min(0).max(16).optional(),
 		/** revive 专用：要复活的玩家 uuid */
 		target: z.string().min(1).optional(),
+		/** weapon 专用：切换到的武器 */
+		weapon: z.enum(['sword', 'bow']).optional(),
 	})
 	.strict()
 export type MpActionPayload = z.infer<typeof MpActionPayloadSchema>

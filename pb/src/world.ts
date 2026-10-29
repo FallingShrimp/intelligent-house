@@ -70,6 +70,17 @@ const WAVE_SPEED = 12     // m/s
 const WAVE_TTL_S = 1.2    // 飞行寿命（约 14m 射程）
 const WAVE_RADIUS = 0.9   // 命中判定半径
 
+// 苍弓（球状闪电 / 巨型激光）
+const ORB_SPEED = 16      // 球状闪电飞行速度 m/s
+const ORB_TTL_S = 6       // 球状闪电持续时间 s（自发射起计，含附着 tick 期）
+const ORB_TICK_S = 0.1    // 球状闪电附着 tick 间隔
+const BEAM_TICK_S = 0.2   // 巨型激光 tick 间隔
+const ORB_HIT_Z = 0.55    // 球状闪电命中僵尸：采样点到弹道距离阈值
+const ORB_HIT_P = 0.6     // 球状闪电命中玩家：中心点（1.0 高）距离阈值
+const BEAM_RANGE = 20     // 激光射程 m
+const BEAM_HIT_Z = 0.55   // 激光命中僵尸：采样点到射线垂距阈值
+const BEAM_HIT_P = 0.6    // 激光命中玩家：中心点垂距阈值
+
 // 僵尸碰撞圆柱（包裹全部模型：模型横向半宽 ~0.45 / 头顶 ~1.87，含动态手臂余量取 R0.55）
 const Z_HIT_R = 0.55
 const Z_HIT_H = 1.9
@@ -99,6 +110,21 @@ interface Wave {
 	t: number
 	reg: number
 	hits: string[]
+}
+
+/** 飞行 / 附着中的球状闪电（苍弓普攻弹道） */
+interface Orb {
+	owner: string
+	id: number
+	x: number; y: number; z: number
+	/** 飞行方向（3D 单位向量 = 发射时准星朝向）；附着后不再推进 */
+	dx: number; dy: number; dz: number
+	/** 附着目标 key（`z<id>` / 玩家 uuid）；null = 飞行中 */
+	target: string | null
+	/** 下次附着 tick 结算时刻（epoch 秒） */
+	tickAt: number
+	/** 发射起累计存活秒数（含附着期，ORB_TTL_S 到期消失） */
+	t: number
 }
 
 /** 玩家词条键：一切可被三选一增益的数值统一挂在 MpPlayer.stats 中管理 */
@@ -143,6 +169,9 @@ export interface DamageSource {
 	impact: number        // 受击者扣除的体力基值（T2b 冲击力/稳定性公式挂点）
 }
 
+/** 武器 ID：双手剑 / 苍弓 */
+export type WeaponId = 'sword' | 'bow'
+
 export interface MpPlayer {
 	uuid: string
 	name: string
@@ -170,9 +199,15 @@ export interface MpPlayer {
 	kills: number
 	/** 词条表：攻击力 / 上限 / 格挡 / 荆棘 / 吸血 / 暴击等全部增益数值 */
 	stats: Record<StatKey, number>
+	/** 当前武器（Q/E 切换，mp_action weapon） */
+	weapon: WeaponId
+	/** 重击蓄力开始时刻 epoch 秒（苍弓激光；-1 = 未蓄力） */
+	chargeStartAt: number
 	/** 连发剑气队列：剩余发数 + 下一发时刻（间隔 0.1s） */
 	waveQueue: number
 	waveNextAt: number
+	/** 苍弓持续激光下一 tick 时刻（epoch 秒；chargeStartAt >= 0 时每 0.2s 结算） */
+	beamNextAt: number
 	/** 三选一选择状态（进行中时非空）：随机 3 个选项索引 + 已选 */
 	pick: { options: number[]; choice: number | null } | null
 	/** 下落攻击判定：由 10Hz 位置差分推导的垂直速度 m/s */
@@ -227,6 +262,12 @@ export type MpEvent =
 	| { kind: 'counter_open' }
 	| { kind: 'roar_interrupt'; id: number }
 	| { kind: 'wave'; by: string; x: number; y: number; z: number; dx: number; dy: number; dz: number; roll: number }
+	/** 苍弓射球：by 玩家从 (x,y,z) 沿 3D (dx,dy,dz) 发射球状闪电（PF 本地渲染飞行视觉，伤害由 PB 裁决） */
+	| { kind: 'orb'; by: string; id: number; x: number; y: number; z: number; dx: number; dy: number; dz: number }
+	/** 球状闪电停止前进：target = 附着目标 key（PF 跟随目标渲染）；null = 球消失（PF 移除视觉） */
+	| { kind: 'orb_stop'; id: number; x: number; y: number; z: number; target: string | null }
+	/** 苍弓蓄满爆发：一道 40 伤激光沿 (dx,dy,dz)（PF 播爆发特效 + 微震，伤害由 PB 射线裁决） */
+	| { kind: 'beam_burst'; by: string; x: number; y: number; z: number; dx: number; dy: number; dz: number }
 
 export interface WorldSnapshot {
 	t: number
@@ -246,6 +287,7 @@ export interface WorldSnapshot {
 		thorn_pct: number; lifesteal: number; multi_wave: number
 		impact: number; stability: number
 		crit_rate: number; crit_dmg: number
+		weapon: WeaponId
 		pick: { options: number[]; done: boolean } | null
 	}[]
 	zombies: {
@@ -263,13 +305,19 @@ export class World {
 	zombies: MpZombie[] = []
 	/** 飞行中的重击剑气（PB 权威弹道，扇形碰撞箱随随机 roll 旋转） */
 	waves: Wave[] = []
+	/** 飞行 / 附着中的球状闪电（苍弓普攻弹道） */
+	orbs: Orb[] = []
+	private orbSeq = 0
 	chaseLeft = 0
 	chaseUntil = 0
-	private events: MpEvent[] = []
+	/** 瞬时事件队列（同模块武器实例也会推入，如 counter_open / orb） */
+	events: MpEvent[] = []
 	private byWs = new Map<string, string>() // wsId → uuid
 	private zSeq = 0
 	/** 补员世代：每只僵尸死亡 +1（决定补员僵尸的血量/伤害递进） */
 	private zTier = 0
+	/** 武器裁决实例（同模块 BaseWeapon 实现：双手剑 / 苍弓，可访问下方公开的裁决方法） */
+	private weapons: Record<WeaponId, BaseWeapon> = { sword: new SwordWeapon(this), bow: new BowWeapon(this) }
 
 	// ---------------- 玩家生命周期 ----------------
 
@@ -290,7 +338,8 @@ export class World {
 			lastStaminaUse: -10, lastAttack: 0, combo: -1,
 			kills: 0,
 			stats: { ...STAT_DEFAULTS },
-			waveQueue: 0, waveNextAt: 0,
+			weapon: 'sword', chargeStartAt: -1,
+			waveQueue: 0, waveNextAt: 0, beamNextAt: 0,
 			pick: null,
 			vy: 0, lastY: 1.6, lastInputAt: 0,
 			blockTimes: [],
@@ -342,7 +391,7 @@ export class World {
 		}
 	}
 
-	action(uuid: string, d: { kind: 'attack' | 'parry_start' | 'parry_stop' | 'respawn' | 'wave' | 'pick' | 'revive' | 'lamp'; segment?: number; hold?: number; idx?: number; target?: string }): void {
+	action(uuid: string, d: { kind: 'attack' | 'parry_start' | 'parry_stop' | 'respawn' | 'wave' | 'pick' | 'revive' | 'lamp' | 'weapon' | 'shoot' | 'charge_start' | 'charge_stop'; segment?: number; hold?: number; idx?: number; target?: string; weapon?: WeaponId }): void {
 		const p = this.players.get(uuid)
 		if (!p) return
 		const now = this.now()
@@ -359,6 +408,12 @@ export class World {
 			if (p.mode === 'fp') this.maybeSpawnZombie()
 			return
 		}
+		// 武器切换：蓄力中拒绝，其余即时生效（快照回写为准）
+		if (d.kind === 'weapon') {
+			if (!d.weapon || p.chargeStartAt >= 0) return
+			p.weapon = d.weapon
+			return
+		}
 		if (d.kind === 'parry_start') {
 			if (p.stunUntil > now || p.blocking || now < p.blockCdUntil || now < p.guardBreakUntil) return
 			p.blocking = true
@@ -371,11 +426,22 @@ export class World {
 			p.blockCdUntil = now + BLOCK_CD_S
 			return
 		}
+		// 武器动作路由：wave = 蓄满松手（hold 为按住秒数）；charge_* = 苍弓重击生命周期
+		const weapon = this.weapons[p.weapon]
 		if (d.kind === 'wave') {
-			this.fireWave(p, now, d.hold)
+			weapon.heavyAttack(p, d.hold ?? 1, now)
 			return
 		}
-		this.playerAttack(p, d.segment ?? 0, now)
+		if (d.kind === 'charge_start') {
+			weapon.startCharge(p, now)
+			return
+		}
+		if (d.kind === 'charge_stop') {
+			weapon.stopCharge(p, now)
+			return
+		}
+		// attack（剑近战）/ shoot（弓射球）：普攻裁决由当前武器实现
+		weapon.normalAttack(p, d.segment ?? 0, now)
 	}
 
 	// ---------------- 重击剑气（远程弹道，PB 权威裁决） ----------------
@@ -386,8 +452,8 @@ export class World {
 		return z > 3.0 ? 2 : 1
 	}
 
-	/** 剑气飞行方向：摄像机准星 3D 前向；无输入时退化为水平朝向 */
-	private waveDir(p: MpPlayer): [number, number, number] {
+	/** 剑气飞行方向：摄像机准星 3D 前向；无输入时退化为水平朝向（武器实例可访问） */
+	waveDir(p: MpPlayer): [number, number, number] {
 		const len = Math.hypot(p.lookX, p.lookY, p.lookZ)
 		if (len >= 0.01) return [p.lookX / len, p.lookY / len, p.lookZ / len]
 		const hl = Math.hypot(p.dirX, p.dirZ)
@@ -395,27 +461,13 @@ export class World {
 		return [Math.sin(p.yaw), 0, -Math.cos(p.yaw)]
 	}
 
-	private fireWave(p: MpPlayer, now: number, hold?: number): void {
-		if (p.stunUntil > now || now < p.guardBreakUntil) return
-		// 有效蓄力时长：按住秒数 × 蓄力速度，钳到蓄力上限（伤害 = atk × 300% × effHold）
-		const effHold = Math.min((hold ?? 1) * p.stats.chargeSpd, p.stats.chargeMax)
-		this.emitWave(p, now, this.chargeWaveDmg(p, effHold))
-		// 蓄力消耗：每秒 10 体力（发射时一次结算，effHold 已被 chargeMax 钳制）
-		this.useStamina(p, 10 * effHold, now)
-		// 连续剑气：蓄力发射后每 0.1s 追发一发（眩晕 / 死亡时由 tick 中止）
-		if (p.stats.multiWave > 0 && p.stunUntil <= now) {
-			p.waveQueue = p.stats.multiWave
-			p.waveNextAt = now + 0.1
-		}
-	}
-
-	/** 剑气伤害 = 攻击力 × 300% × 有效蓄力时长 × 全局伤害倍率 */
-	private chargeWaveDmg(p: MpPlayer, effHold: number): number {
+	/** 剑气伤害 = 攻击力 × 300% × 有效蓄力时长 × 全局伤害倍率（双手剑武器实例可访问） */
+	chargeWaveDmg(p: MpPlayer, effHold: number): number {
 		return p.stats.atk * 3 * effHold * p.stats.dmgMul
 	}
 
-	/** 发射一发剑气：方向取当前准星 3D 朝向，绕飞行轴随机 roll 旋转碰撞箱与视觉 */
-	private emitWave(p: MpPlayer, now: number, dmg: number): void {
+	/** 发射一发剑气：方向取当前准星 3D 朝向，绕飞行轴随机 roll 旋转碰撞箱与视觉（武器实例可访问） */
+	emitWave(p: MpPlayer, now: number, dmg: number): void {
 		const [dx, dy, dz] = this.waveDir(p)
 		const roll = Math.random() * Math.PI * 2
 		const { c, n } = waveBasis(dx, dy, dz, roll)
@@ -488,42 +540,139 @@ export class World {
 		}
 	}
 
-	// ---------------- 玩家攻击裁决 ----------------
+	// ---------------- 苍弓（球状闪电 / 巨型激光，由 BowWeapon 实例调用） ----------------
 
-	private playerAttack(p: MpPlayer, segment: number, now: number): void {
-		if (p.stunUntil > now || now < p.guardBreakUntil) return
-		if (now - p.lastAttack < ATTACK_MIN_INTERVAL) return
-		p.lastAttack = now
-
-		// 目标选择：僵尸优先逻辑与单机一致——按距离取最近（僵尸与玩家同池）
-		const tgt = this.findMeleeTarget(p)
-		if (!tgt) return // 空挥
-
-		// 反击：僵尸眩晕窗口内
-		if (tgt.zombie && tgt.zombie.state === 'stunned' &&
-			now - tgt.zombie.stunStart <= COUNTER_WINDOW_S && tgt.dist <= COUNTER_REACH) {
-			this.damageZombie(tgt.zombie, this.playerHit(p, p.stats.atk * 3 * p.stats.dmgMul), p, now)
-			this.chaseLeft = 3
-			this.chaseUntil = now + CHASE_WINDOW_S
-			this.events.push({ kind: 'counter_open' })
-			return
-		}
-		// 追击：全局追击窗口
-		if (this.chaseLeft > 0 && now <= this.chaseUntil) {
-			this.chaseLeft--
-			if (tgt.zombie) this.damageZombie(tgt.zombie, this.playerHit(p, p.stats.atk * 1.2 * p.stats.dmgMul), p, now)
-			else this.damagePlayer(tgt.player!, this.playerHit(p, p.stats.atk * 1.2 * p.stats.dmgMul), p, now, false)
-			return
-		}
-		const segMul = COMBO_MUL[((segment % 3) + 3) % 3]
-		// segment 3 = 空中戳刺（伤害同首段，冲击力 25）；其余普攻段冲击力 3
-		const dmg = this.playerHit(p, p.stats.atk * segMul * p.stats.dmgMul, segment === 3 ? 25 : 3)
-		if (tgt.zombie) this.damageZombie(tgt.zombie, dmg, p, now)
-		else this.damagePlayer(tgt.player!, dmg, p, now, false)
+	/** 发射一发球状闪电：方向 = 准星 3D 前向，首中即停附着（武器实例可访问） */
+	emitOrb(p: MpPlayer, _now: number): void {
+		const [dx, dy, dz] = this.waveDir(p)
+		const x = p.x + dx * 0.5
+		const y = p.y + dy * 0.5
+		const z = p.z + dz * 0.5
+		const orb: Orb = { owner: p.uuid, id: ++this.orbSeq, x, y, z, dx, dy, dz, target: null, tickAt: 0, t: 0 }
+		this.orbs.push(orb)
+		this.events.push({ kind: 'orb', by: p.uuid, id: orb.id, x, y, z, dx, dy, dz })
 	}
 
-	/** 玩家攻击构造 DamageSource：掷暴击（命中 critRate → 伤害 ×(1+critDmg)）；impact 默认 3（普攻/反击/追击同值） */
-	private playerHit(p: MpPlayer, amount: number, impact = 3): DamageSource {
+	/** 球状闪电停止/消失事件：target = 附着 key；null = 球消失（PF 移除视觉） */
+	private emitOrbStop(id: number, x: number, y: number, z: number, target: string | null): void {
+		this.events.push({ kind: 'orb_stop', id, x, y, z, target })
+	}
+
+	/** 解析附着目标（key = `z<id>` / 玩家 uuid）：死亡 / 离场返回 null */
+	private orbTarget(key: string): { z: MpZombie | null; p: MpPlayer | null; cx: number; cy: number; cz: number } | null {
+		if (key.startsWith('z')) {
+			const id = Number(key.slice(1))
+			const z = this.zombies.find((zz) => zz.id === id)
+			if (!z || z.state === 'dead') return null
+			return { z, p: null, cx: z.x, cy: 1.05, cz: z.z } // 僵尸躯干中心
+		}
+		const p = this.players.get(key)
+		if (!p || p.mode !== 'fp' || p.hp <= 0) return null
+		return { z: null, p, cx: p.x, cy: 1.0, cz: p.z }
+	}
+
+	/** 球状闪电单次伤害结算：3 × dmgMul / impact 1（Q1 不吃 atk；Q7 不暴击、吃吸血走统一结算） */
+	private orbHit(by: MpPlayer, tgt: { z: MpZombie | null; p: MpPlayer | null }, now: number): void {
+		const dmg: DamageSource = { from: `p:${by.uuid}`, amount: 3 * by.stats.dmgMul, sign: DamageSign.Normal, impact: 1 }
+		if (tgt.z) this.damageZombie(tgt.z, dmg, by, now)
+		else if (tgt.p) this.damagePlayer(tgt.p, dmg, by, now, false, true)
+	}
+
+	/** 首中即停（无穿透）：僵尸采样点 / 玩家中心到本帧飞行线段距离达标 → 返回目标 key */
+	private orbFirstHit(o: Orb, nx: number, ny: number, nz: number): string | null {
+		for (const z of this.zombies) {
+			if (z.state === 'dead') continue
+			for (const [ox, oy, oz] of Z_HIT_SAMPLES) {
+				if (pointSegDist(o.x, o.y, o.z, nx, ny, nz, z.x + ox, oy, z.z + oz) <= ORB_HIT_Z) return `z${z.id}`
+			}
+		}
+		for (const p of this.players.values()) {
+			if (p.uuid === o.owner || p.mode !== 'fp' || p.hp <= 0) continue
+			if (pointSegDist(o.x, o.y, o.z, nx, ny, nz, p.x, 1.0, p.z) <= ORB_HIT_P) return p.uuid
+		}
+		return null
+	}
+
+	private tickOrbs(dt: number, now: number): void {
+		for (let i = this.orbs.length - 1; i >= 0; i--) {
+			const o = this.orbs[i]
+			o.t += dt
+			const by = this.players.get(o.owner)
+			// 主人离场 / 持续 6s 到期 → 消失
+			if (!by || o.t > ORB_TTL_S) {
+				this.orbs.splice(i, 1)
+				this.emitOrbStop(o.id, o.x, o.y, o.z, null)
+				continue
+			}
+			if (o.target !== null) {
+				// 附着：跟随目标中心，每 0.1s 结算（目标死亡 / 离场 → 消失）
+				const tgt = this.orbTarget(o.target)
+				if (!tgt) {
+					this.orbs.splice(i, 1)
+					this.emitOrbStop(o.id, o.x, o.y, o.z, null)
+					continue
+				}
+				o.x = tgt.cx; o.y = tgt.cy; o.z = tgt.cz
+				if (now >= o.tickAt) {
+					o.tickAt = now + ORB_TICK_S
+					this.orbHit(by, tgt, now)
+				}
+				continue
+			}
+			// 飞行：直线推进 + 线段扫掠判定（防高速隧穿）
+			const step = ORB_SPEED * dt
+			const nx = o.x + o.dx * step
+			const ny = o.y + o.dy * step
+			const nz = o.z + o.dz * step
+			const reg0 = this.region(o.x, o.z)
+			const reg = this.region(nx, nz)
+			// 撞墙：跨入/跨出门廊（四面墙）；室内 ↔ 坝坝开放连通不拦（与剑气一致）
+			if (reg !== reg0 && (reg === 0 || reg0 === 0)) {
+				this.orbs.splice(i, 1)
+				this.emitOrbStop(o.id, nx, ny, nz, null)
+				continue
+			}
+			// 撞地 / 天花板（室内 2.8m、门廊 2.45m；室外无顶）
+			if (ny <= 0.06 || (reg === 1 && ny >= 2.72) || (reg === 0 && ny >= 2.4)) {
+				this.orbs.splice(i, 1)
+				this.emitOrbStop(o.id, nx, ny, nz, null)
+				continue
+			}
+			const hit = this.orbFirstHit(o, nx, ny, nz)
+			o.x = nx; o.y = ny; o.z = nz
+			if (hit) {
+				// 首中即停：附着目标并立刻结算第一跳，之后每 0.1s
+				o.target = hit
+				o.tickAt = now + ORB_TICK_S
+				this.emitOrbStop(o.id, o.x, o.y, o.z, o.target)
+				const tgt = this.orbTarget(hit)
+				if (tgt) this.orbHit(by, tgt, now)
+			}
+		}
+	}
+
+	/** 巨型激光射线结算：射线上所有命中目标（穿透）+ 隔门廊墙拦截（武器实例可访问） */
+	beamDamage(p: MpPlayer, amount: number, impact: number, now: number): void {
+		const [dx, dy, dz] = this.waveDir(p)
+		for (const z of this.zombies) {
+			if (z.state === 'dead') continue
+			if (p.x > -3.5 !== z.x > -3.5 && (z.z < 1.35 || z.z > 2.45)) continue // 隔门廊墙
+			if (!Z_HIT_SAMPLES.some(([ox, oy, oz]) => beamHit(p.x, p.y, p.z, dx, dy, dz, z.x + ox, oy, z.z + oz, BEAM_HIT_Z))) continue
+			this.damageZombie(z, { from: `p:${p.uuid}`, amount, sign: DamageSign.Normal, impact }, p, now)
+		}
+		for (const o of this.players.values()) {
+			if (o.uuid === p.uuid || o.mode !== 'fp' || o.hp <= 0) continue
+			if (p.x > -3.5 !== o.x > -3.5 && (o.z < 1.35 || o.z > 2.45)) continue
+			if (!beamHit(p.x, p.y, p.z, dx, dy, dz, o.x, 1.0, o.z, BEAM_HIT_P)) continue
+			// isWave=true：命中玩家走 impact 扣体力路径（与剑气一致）
+			this.damagePlayer(o, { from: `p:${p.uuid}`, amount, sign: DamageSign.Normal, impact }, p, now, false, true)
+		}
+	}
+
+	// ---------------- 玩家攻击裁决（由武器实例实现，见文件底部 BaseWeapon 体系） ----------------
+
+	/** 玩家攻击构造 DamageSource：掷暴击（命中 critRate → 伤害 ×(1+critDmg)）；impact 默认 3（普攻/反击/追击同值，武器实例可访问） */
+	playerHit(p: MpPlayer, amount: number, impact = 3): DamageSource {
 		const crit = Math.random() < p.stats.critRate
 		return {
 			from: `p:${p.uuid}`,
@@ -533,7 +682,8 @@ export class World {
 		}
 	}
 
-	private findMeleeTarget(p: MpPlayer): { zombie: MpZombie | null; player: MpPlayer | null; dist: number } | null {
+	/** 目标选择：僵尸优先逻辑与单机一致——按距离取最近（武器实例可访问） */
+	findMeleeTarget(p: MpPlayer): { zombie: MpZombie | null; player: MpPlayer | null; dist: number } | null {
 		let bestZ: MpZombie | null = null
 		let bestZd = Infinity
 		for (const z of this.zombies) {
@@ -570,9 +720,9 @@ export class World {
 		return { ok: true, dist }
 	}
 
-	// ---------------- 伤害结算 ----------------
+	// ---------------- 伤害结算（武器实例可访问） ----------------
 
-	private damageZombie(z: MpZombie, dmg: DamageSource, by: MpPlayer, _now: number): void {
+	damageZombie(z: MpZombie, dmg: DamageSource, by: MpPlayer, _now: number): void {
 		if (z.state === 'dead') return
 		// 嘶吼前摇中受到 ≥15 伤害 → 打断
 		if (z.state === 'roar' && dmg.amount >= 15) {
@@ -707,8 +857,8 @@ export class World {
 		return null
 	}
 
-	/** 对玩家造成伤害：格挡评估 → 扣血 → 死亡重生（PVP 与僵尸攻击共用） */
-	private damagePlayer(v: MpPlayer, dmg: DamageSource, by: MpPlayer | null, now: number, fromZombie: boolean, isWave = false): void {
+	/** 对玩家造成伤害：格挡评估 → 扣血 → 死亡重生（PVP 与僵尸攻击共用；武器实例可访问） */
+	damagePlayer(v: MpPlayer, dmg: DamageSource, by: MpPlayer | null, now: number, fromZombie: boolean, isWave = false): void {
 		if (v.hp <= 0) return
 		if (v.stunUntil > now) {
 			if (isWave) this.useStamina(v, dmg.impact, now, by) // 被剑气命中扣体力
@@ -843,8 +993,8 @@ export class World {
 		this.events.push({ kind: 'respawn', uuid: p.uuid, pos: [p.x, p.y, p.z] })
 	}
 
-	/** 扣体力：扣除量 = 基值 × 攻击者冲击力 / 受击者稳定性（僵尸无词条恒 1；无攻击者冲击力按 100%） */
-	private useStamina(p: MpPlayer, n: number, now: number, attacker?: MpPlayer | MpZombie | null): number {
+	/** 扣体力：扣除量 = 基值 × 攻击者冲击力 / 受击者稳定性（僵尸无词条恒 1；无攻击者冲击力按 100%；武器实例可访问） */
+	useStamina(p: MpPlayer, n: number, now: number, attacker?: MpPlayer | MpZombie | null): number {
 		const ai = attacker && 'stats' in attacker ? attacker.stats.impact : 1
 		const cost = (n * ai) / p.stats.stability
 		p.stamina = Math.max(0, p.stamina - cost)
@@ -1178,22 +1328,21 @@ export class World {
 		if (this.pickPhase) return
 		// 空场清理：房间内没有第一人称玩家时清除所有僵尸
 		this.clearZombiesIfEmpty()
-		// 玩家：体力耗尽眩晕结束回满 / 连发剑气队列 / 体力回复
+		// 玩家：体力耗尽眩晕结束回满 / 武器持续行为与蓄满自动触发 / 体力回复
 		for (const p of this.players.values()) {
 			// 体力耗尽眩晕到期 → 体力恢复到 100%
 			if (p.exhaustUntil > 0 && now >= p.exhaustUntil) {
 				p.exhaustUntil = 0
 				if (p.hp > 0) p.stamina = p.stats.maxSt
 			}
-			// 连续剑气：每 0.1s 追发一发（眩晕 / 死亡中止），伤害等同满蓄力
-			if (p.waveQueue > 0 && now >= p.waveNextAt) {
-				if (p.hp <= 0 || p.stunUntil > now) {
-					p.waveQueue = 0
-				} else {
-					this.emitWave(p, now, this.chargeWaveDmg(p, p.stats.chargeMax))
-					p.waveQueue--
-					p.waveNextAt = now + 0.1
-				}
+			// 武器持续行为（连发剑气队列 / 激光 tick 等）
+			const weapon = this.weapons[p.weapon]
+			weapon.tick?.(p, dt, now)
+			// 蓄力中止：死亡 / 眩晕（含连发剑气队列，由各武器 tick 自行清理）
+			if (p.chargeStartAt >= 0 && (p.hp <= 0 || p.stunUntil > now)) p.chargeStartAt = -1
+			// 蓄满自动触发：maxChargeReached → 立刻 heavyAttack 并停止蓄力
+			if (p.chargeStartAt >= 0 && weapon.maxChargeReached(p, now)) {
+				weapon.heavyAttack(p, now - p.chargeStartAt, now)
 			}
 			if (
 				!p.blocking && p.stamina < p.stats.maxSt &&
@@ -1208,6 +1357,8 @@ export class World {
 		this.zombies = this.zombies.filter((z) => !(z.state === 'dead' && now - z.deadAt > ZOMBIE_TTL_DEAD))
 		// 重击剑气弹道
 		this.tickWaves(dt, now)
+		// 苍弓球状闪电弹道
+		this.tickOrbs(dt, now)
 		// 全局追击窗口过期
 		if (this.chaseLeft > 0 && now > this.chaseUntil) this.chaseLeft = 0
 	}
@@ -1241,6 +1392,7 @@ export class World {
 				crit_rate: p.stats.critRate, crit_dmg: p.stats.critDmg,
 				huaqi: round2(p.stats.huaqi),
 				def: p.stats.def,
+				weapon: p.weapon,
 				pick: p.pick ? { options: p.pick.options, done: p.pick.choice !== null } : null,
 			})),
 			zombies: this.zombies.map((z) => ({
@@ -1266,6 +1418,155 @@ export class World {
 			}
 		}
 		return `hsl(${Math.floor(Math.random() * 360)}, 75%, 55%)`
+	}
+}
+
+// ---------------- 武器系统（BaseWeapon 抽象 + 双手剑 / 苍弓） ----------------
+
+/**
+ * 武器抽象：普攻 / 蓄力 / 重击 / 蓄满自动触发的裁决入口。
+ * 实例与 World 同模块（world.ts），可直接访问 World 公开的裁决方法
+ * （playerHit / findMeleeTarget / damageZombie / damagePlayer / useStamina /
+ * emitWave / chargeWaveDmg / waveDir / events）。
+ */
+abstract class BaseWeapon {
+	abstract weaponName: string
+	/** 普攻裁决（PF 点击上报 attack / shoot） */
+	abstract normalAttack(p: MpPlayer, segment: number, now: number): void
+	/** 开始重击蓄力（PF 按住上报 charge_start） */
+	abstract startCharge(p: MpPlayer, now: number): void
+	/** 提前松手（未蓄满，PF 上报 charge_stop） */
+	abstract stopCharge(p: MpPlayer, now: number): void
+	/** 重击蓄力完成（蓄满松手 wave / tick 轮询蓄满自动触发；实现内自行清理 chargeStartAt） */
+	abstract heavyAttack(p: MpPlayer, timeCharged: number, now: number): void
+	/** tick 轮询：蓄力达到上限返回 true → World 立刻调 heavyAttack 并停止蓄力 */
+	abstract maxChargeReached(p: MpPlayer, now: number): boolean
+	/** 持续行为钩子（连发剑气队列 / 激光 tick），可选 */
+	tick?(p: MpPlayer, dt: number, now: number): void
+}
+
+/** 双手剑：现攻击逻辑解耦（三段近战 + 反击 / 追击裁决 + 蓄力剑气 + 连发队列），行为不变 */
+class SwordWeapon extends BaseWeapon {
+	weaponName = '双手剑'
+	constructor(private world: World) { super() }
+
+	normalAttack(p: MpPlayer, segment: number, now: number): void {
+		const w = this.world
+		if (p.stunUntil > now || now < p.guardBreakUntil) return
+		if (now - p.lastAttack < ATTACK_MIN_INTERVAL) return
+		p.lastAttack = now
+
+		// 目标选择：僵尸优先逻辑与单机一致——按距离取最近（僵尸与玩家同池）
+		const tgt = w.findMeleeTarget(p)
+		if (!tgt) return // 空挥
+
+		// 反击：僵尸眩晕窗口内
+		if (tgt.zombie && tgt.zombie.state === 'stunned' &&
+			now - tgt.zombie.stunStart <= COUNTER_WINDOW_S && tgt.dist <= COUNTER_REACH) {
+			w.damageZombie(tgt.zombie, w.playerHit(p, p.stats.atk * 3 * p.stats.dmgMul), p, now)
+			w.chaseLeft = 3
+			w.chaseUntil = now + CHASE_WINDOW_S
+			w.events.push({ kind: 'counter_open' })
+			return
+		}
+		// 追击：全局追击窗口
+		if (w.chaseLeft > 0 && now <= w.chaseUntil) {
+			w.chaseLeft--
+			if (tgt.zombie) w.damageZombie(tgt.zombie, w.playerHit(p, p.stats.atk * 1.2 * p.stats.dmgMul), p, now)
+			else w.damagePlayer(tgt.player!, w.playerHit(p, p.stats.atk * 1.2 * p.stats.dmgMul), p, now, false)
+			return
+		}
+		const segMul = COMBO_MUL[((segment % 3) + 3) % 3]
+		// segment 3 = 空中戳刺（伤害同首段，冲击力 25）；其余普攻段冲击力 3
+		const dmg = w.playerHit(p, p.stats.atk * segMul * p.stats.dmgMul, segment === 3 ? 25 : 3)
+		if (tgt.zombie) w.damageZombie(tgt.zombie, dmg, p, now)
+		else w.damagePlayer(tgt.player!, dmg, p, now, false)
+	}
+
+	/** 剑的蓄力是纯 PF 本地概念（PB 只在 wave 上报时用 hold 结算），无需跟踪 */
+	startCharge(_p: MpPlayer, _now: number): void { /* 剑：无 PB 侧蓄力状态 */ }
+	stopCharge(_p: MpPlayer, _now: number): void { /* 剑：无 PB 侧蓄力状态 */ }
+
+	/** 重击剑气：effHold = min(hold × chargeSpd, chargeMax)，伤害与体力结算与解耦前完全一致 */
+	heavyAttack(p: MpPlayer, timeCharged: number, now: number): void {
+		const w = this.world
+		if (p.stunUntil > now || now < p.guardBreakUntil) return
+		// 有效蓄力时长：按住秒数 × 蓄力速度，钳到蓄力上限（伤害 = atk × 300% × effHold）
+		const effHold = Math.min(timeCharged * p.stats.chargeSpd, p.stats.chargeMax)
+		w.emitWave(p, now, w.chargeWaveDmg(p, effHold))
+		// 蓄力消耗：每秒 10 体力（发射时一次结算，effHold 已被 chargeMax 钳制）
+		w.useStamina(p, 10 * effHold, now)
+		// 连续剑气：蓄力发射后每 0.1s 追发一发（眩晕 / 死亡时由 tick 中止）
+		if (p.stats.multiWave > 0 && p.stunUntil <= now) {
+			p.waveQueue = p.stats.multiWave
+			p.waveNextAt = now + 0.1
+		}
+	}
+
+	/** 蓄满不自动释放（松手才发剑气，与解耦前一致） */
+	maxChargeReached(_p: MpPlayer, _now: number): boolean { return false }
+
+	/** 连续剑气：每 0.1s 追发一发（眩晕 / 死亡中止），伤害等同满蓄力 */
+	tick(p: MpPlayer, _dt: number, now: number): void {
+		if (p.waveQueue <= 0 || now < p.waveNextAt) return
+		if (p.hp <= 0 || p.stunUntil > now) {
+			p.waveQueue = 0
+			return
+		}
+		const w = this.world
+		w.emitWave(p, now, w.chargeWaveDmg(p, p.stats.chargeMax))
+		p.waveQueue--
+		p.waveNextAt = now + 0.1
+	}
+}
+
+/** 苍弓：普攻射球状闪电（首中附着，0.1s/3 伤持续 6s）+ 按住重击持续激光（0.2s/15 伤），蓄满爆发 40 伤 */
+class BowWeapon extends BaseWeapon {
+	weaponName = '苍弓'
+	constructor(private world: World) { super() }
+
+	/** 射球状闪电（'shoot' 上报触发）：方向 = 准星 3D 前向 */
+	normalAttack(p: MpPlayer, _segment: number, now: number): void {
+		const w = this.world
+		if (p.stunUntil > now || now < p.guardBreakUntil) return
+		if (now - p.lastAttack < ATTACK_MIN_INTERVAL) return
+		p.lastAttack = now
+		w.emitOrb(p, now)
+	}
+
+	/** 按住开始蓄力（持续激光由 tick 结算；眩晕 / 破防拒绝，与剑气一致） */
+	startCharge(p: MpPlayer, now: number): void {
+		if (p.stunUntil > now || now < p.guardBreakUntil) return
+		p.chargeStartAt = now
+		p.beamNextAt = 0 // 立即射出第一段激光
+	}
+
+	/** 提前松手：激光停止，无爆发 */
+	stopCharge(p: MpPlayer, _now: number): void {
+		p.chargeStartAt = -1
+	}
+
+	/** 蓄满爆发：一道 40 × dmgMul 伤激光（射线判定同持续激光）后立刻停止 */
+	heavyAttack(p: MpPlayer, _timeCharged: number, now: number): void {
+		const w = this.world
+		p.chargeStartAt = -1
+		if (p.stunUntil > now || now < p.guardBreakUntil) return
+		const [dx, dy, dz] = w.waveDir(p)
+		w.events.push({ kind: 'beam_burst', by: p.uuid, x: p.x, y: p.y, z: p.z, dx, dy, dz })
+		w.beamDamage(p, 40 * p.stats.dmgMul, 11, now)
+	}
+
+	/** 蓄力达到上限（chargeDur = chargeMax / chargeSpd，与剑同公式）→ World tick 自动触发爆发 */
+	maxChargeReached(p: MpPlayer, now: number): boolean {
+		return p.chargeStartAt >= 0 && now - p.chargeStartAt >= p.stats.chargeMax / p.stats.chargeSpd
+	}
+
+	/** 持续激光：蓄力中每 0.2s 对准星射线目标结算 15 × dmgMul 伤 / impact 3（穿透 + 隔墙拦截） */
+	tick(p: MpPlayer, _dt: number, now: number): void {
+		if (p.chargeStartAt < 0 || p.hp <= 0 || p.stunUntil > now || now < p.guardBreakUntil) return
+		if (now < p.beamNextAt) return
+		p.beamNextAt = now + BEAM_TICK_S
+		this.world.beamDamage(p, 15 * p.stats.dmgMul, 3, now)
 	}
 }
 
@@ -1339,6 +1640,32 @@ function zombieWaveHit(w: Wave, zx: number, zz: number): boolean {
 		if (waveHit(w, zx + ox, oy, zz + oz)) return true
 	}
 	return false
+}
+
+/** 点到线段距离（球状闪电扫掠命中判定用，防高速隧穿） */
+function pointSegDist(ax: number, ay: number, az: number, bx: number, by: number, bz: number, px: number, py: number, pz: number): number {
+	const abx = bx - ax
+	const aby = by - ay
+	const abz = bz - az
+	const apx = px - ax
+	const apy = py - ay
+	const apz = pz - az
+	const len2 = abx * abx + aby * aby + abz * abz
+	const t = len2 > 1e-9 ? Math.max(0, Math.min(1, (apx * abx + apy * aby + apz * abz) / len2)) : 0
+	return Math.hypot(apx - abx * t, apy - aby * t, apz - abz * t)
+}
+
+/**
+ * 激光射线命中测试：目标点到射线垂距 ≤ hitR，且投影沿正方向、垂足距离 ≤ BEAM_RANGE
+ * （穿透判定——射线上所有达标目标都结算，由 beamDamage 逐目标调用）
+ */
+function beamHit(ox: number, oy: number, oz: number, dx: number, dy: number, dz: number, tx: number, ty: number, tz: number, hitR: number): boolean {
+	const vx = tx - ox
+	const vy = ty - oy
+	const vz = tz - oz
+	const a = vx * dx + vy * dy + vz * dz // 沿射线投影
+	if (a < 0 || a > BEAM_RANGE) return false
+	return Math.hypot(vx - a * dx, vy - a * dy, vz - a * dz) <= hitR
 }
 
 function hslHue(color: string): number | null {

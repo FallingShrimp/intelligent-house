@@ -1,15 +1,17 @@
 /**
- * 远程玩家渲染：每个联机对等体渲染为一个彩色圆柱体 + 头顶名牌 + 手持钻石剑
+ * 远程玩家渲染：每个联机对等体渲染为一个彩色圆柱体 + 头顶名牌 + 手持武器
  *
  * - 颜色由 PB 在连接时随机分配（welcome.you / world.players.color）
  * - 位置 / 朝向按 10Hz 快照插值；仅渲染 fp（第一人称）状态的玩家
- * - 动作标签（anim：swing0/1/2、counter、chase、block、stab|<pitch>）驱动剑的挥砍动画与
+ * - 手持武器随快照 weapon 切换（双手剑 / 苍弓简模互斥显示）
+ * - 动作标签（anim：swing0/1/2、counter、chase、block、shoot、beam、stab|<pitch>）驱动武器的挥砍动画与
  *   身体倾斜脉冲；空中戳刺（stab）整体圆柱向目标俯仰方向倾斜；格挡中脚下显示护盾环
  * - 头顶血条（hp 来自 PB 权威快照）；命中溅血粒子（bleed）
  * - 死亡（hp=0）渲染为倒地尸体：横躺变暗 + 名牌 ☠ 标记，仍可被队友点击复活
  */
 import * as THREE from 'three'
-import type { NetPlayerState } from '../protocol/messages'
+import type { NetPlayerState, WeaponId } from '../protocol/messages'
+import { buildRemoteBow } from './bow'
 
 const CYL_R = 0.32
 const CYL_H = 1.7
@@ -17,6 +19,7 @@ const ANIM_DUR = 0.3 // 挥砍动画时长 s（与倾斜脉冲同步）
 const BAR_W = 0.66   // 血条宽
 const BAR_H = 0.075
 const BAR_Y = 1.98   // 血条高度（名牌下方）
+const BEAM_RANGE = 20 // 苍弓激光长度 m（与 PB / SceneManager 一致）
 
 const UP = new THREE.Vector3(0, 1, 0)
 const TILT_RESET = new THREE.Quaternion() // 直立姿态（恒等四元数）
@@ -30,7 +33,11 @@ interface RemoteEntry {
 	shield: THREE.Mesh
 	mat: THREE.MeshStandardMaterial
 	baseColor: THREE.Color
-	arm: THREE.Group // 手腕枢轴（剑挂在上面，动画驱动其旋转）
+	arm: THREE.Group // 手腕枢轴（武器挂在上面，动画驱动其旋转）
+	sword: THREE.Object3D // 简模双手剑（与 bow 按 weapon 互斥显示）
+	bow: THREE.Group      // 简模苍弓
+	weapon: WeaponId      // 当前武器（快照回写驱动切换）
+	beam: THREE.Mesh      // 苍弓蓄力激光（anim='beam' 期间沿面前 +Z 显示）
 	tilt: THREE.Group // 身体倾斜枢轴（空中戳刺 stab|pitch 驱动，外层 yaw 之内）
 	hp: number
 	maxHp: number
@@ -53,6 +60,8 @@ export class RemotePlayers {
 	private map = new Map<string, RemoteEntry>()
 	/** 溅血粒子（burst 生命周期内逐帧更新） */
 	private bursts: { pts: THREE.Points; mat: THREE.PointsMaterial; vel: Float32Array; t: number }[] = []
+
+	private beamPhase = 0 // 远端激光脉动相位（累加 dt）
 
 	/** world 快照应用：增删 / 更新目标（仅 fp 玩家可见；selfUuid 为本客户端自己，不渲染避免遮挡第一人称视角） */
 	applySnapshot(players: NetPlayerState[], selfUuid?: string | null) {
@@ -82,6 +91,13 @@ export class RemotePlayers {
 			if (p.anim && p.anim !== e.animTag) e.animT = ANIM_DUR
 			e.animTag = p.anim
 			e.shield.visible = p.blocking && !dead
+			// 武器切换：按快照 weapon 切换远端手持显隐（剑 ⇄ 弓）
+			const weapon: WeaponId = p.weapon === 'bow' ? 'bow' : 'sword'
+			if (weapon !== e.weapon) {
+				e.weapon = weapon
+				e.sword.visible = weapon === 'sword'
+				e.bow.visible = weapon === 'bow'
+			}
 		}
 		// 移除消失 / 退出第一人称的玩家
 		for (const [uuid, e] of [...this.map]) {
@@ -169,6 +185,7 @@ export class RemotePlayers {
 	}
 
 	update(dt: number) {
+		this.beamPhase += dt
 		for (const e of this.map.values()) {
 			const g = e.group
 			const k = Math.min(1, dt * 10)
@@ -184,6 +201,7 @@ export class RemotePlayers {
 				g.rotation.z += (Math.PI / 2 - g.rotation.z) * kd
 				g.position.y += (0.3 - g.position.y) * kd
 				e.bar.visible = false
+				e.beam.visible = false // 尸体不显示激光
 				continue
 			}
 			g.position.y += (0 - g.position.y) * k
@@ -203,7 +221,14 @@ export class RemotePlayers {
 			} else {
 				e.tilt.quaternion.slerp(TILT_RESET, k)
 			}
-			// 剑动画：按动作标签驱动手腕枢轴旋转（p = 0→1 动画进度）
+			// 苍弓蓄力激光：远端玩家蓄力中（anim='beam'）沿其面前 +Z 显示细光束（脉动）
+			const beamOn = e.weapon === 'bow' && e.animTag === 'beam'
+			e.beam.visible = beamOn
+			if (beamOn) {
+				const bm = e.beam.material as THREE.MeshBasicMaterial
+				bm.opacity = 0.3 + Math.sin(this.beamPhase * 26) * 0.12
+			}
+			// 武器动画：按动作标签驱动手腕枢轴旋转（p = 0→1 动画进度）
 			const arm = e.arm
 			if (e.animT > 0 && e.animTag) {
 				const p = 1 - e.animT / ANIM_DUR
@@ -227,6 +252,12 @@ export class RemotePlayers {
 					case 'block': // 格挡：剑横举胸前（保持姿态到标签结束）
 						arm.rotation.set(Math.PI / 2 * 0.85, 0, 1.0)
 						break
+					case 'shoot': // 苍弓放箭：弓臂由后拉弹回前推
+						arm.rotation.set(THREE.MathUtils.lerp(-0.7, 0.08, s), 0, 0)
+						break
+					case 'beam': // 苍弓瞄准：弓身近乎水平前指
+						arm.rotation.set(-0.1, 0, 0)
+						break
 					default:
 						arm.rotation.set(0.5, 0, 0)
 				}
@@ -234,10 +265,13 @@ export class RemotePlayers {
 					arm.rotation.set(Math.PI / 2 * 0.85, 0, 1.0) // 格挡姿态持续保持
 					arm.position.z = 0.05
 				} else if (e.animTag === 'charge') {
-					arm.rotation.set(-0.9, 0, 0.3) // 蓄力：剑举过头顶
+					arm.rotation.set(e.weapon === 'bow' ? -0.1 : -0.9, 0, 0.3) // 蓄力：弓瞄准 / 剑举过头顶
+					arm.position.z = 0.05
+				} else if (e.animTag === 'beam') {
+					arm.rotation.set(-0.1, 0, 0) // 苍弓瞄准：弓身近乎水平前指
 					arm.position.z = 0.05
 				} else {
-					arm.rotation.set(0.5, 0, 0) // idle 姿态
+					arm.rotation.set(e.weapon === 'bow' ? 0.15 : 0.5, 0, 0) // idle：剑斜向前上 / 弓身放平
 					arm.position.z = 0.05
 				}
 				// 头顶血条（世界层，不随 yaw 旋转；死亡隐藏）
@@ -330,12 +364,29 @@ export class RemotePlayers {
 		shield.visible = false
 		group.add(shield)
 
-		// 手持钻石剑（右手侧，手腕枢轴驱动挥砍动画）
+		// 手持武器（右手侧，手腕枢轴驱动动画）：剑 / 弓按快照 weapon 互斥显示
 		const arm = new THREE.Group()
 		arm.position.set(CYL_R + 0.04, 1.15, 0.05)
 		arm.rotation.set(0.5, 0, 0) // idle：剑尖斜向前上
-		arm.add(buildRemoteSword())
+		const sword = buildRemoteSword()
+		const bow = buildRemoteBow()
+		bow.rotation.y = -Math.PI / 2 // 弧顶（建模 +X）转向玩家前方 +Z
+		bow.visible = p.weapon === 'bow'
+		arm.add(sword, bow)
 		tilt.add(arm)
+
+		// 苍弓蓄力激光：细光束从胸前沿 +Z 延伸（挂 group 层随 yaw 转向，anim='beam' 驱动显隐）
+		const beam = new THREE.Mesh(
+			new THREE.CylinderGeometry(0.03, 0.03, BEAM_RANGE, 8, 1, true),
+			new THREE.MeshBasicMaterial({
+				color: 0x7df9ff, transparent: true, opacity: 0.35,
+				blending: THREE.AdditiveBlending, depthWrite: false,
+			}),
+		)
+		beam.rotation.x = Math.PI / 2 // 圆柱 Y 轴对齐 +Z
+		beam.position.set(0, 1.2, 0.25 + BEAM_RANGE / 2)
+		beam.visible = false
+		group.add(beam)
 
 		// 名牌（canvas + 纹理存入 entry：死亡 ☠ 标记需原位重绘）
 		const labelCanvas = document.createElement('canvas')
@@ -373,6 +424,7 @@ export class RemotePlayers {
 		return {
 			uuid: p.uuid, name: p.name, group, cyl, label, shield, mat,
 			baseColor: color.clone(), arm, tilt, hp: p.hp, maxHp: p.max_hp || 100,
+			sword, bow, beam, weapon: p.weapon === 'bow' ? 'bow' : 'sword',
 			dead: p.hp <= 0, labelCanvas, labelTex, bar, barFill,
 			tX: p.p[0], tZ: p.p[2], tYaw: p.yaw,
 			animTag: p.anim, animT: 0,
