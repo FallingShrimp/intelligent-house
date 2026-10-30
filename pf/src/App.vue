@@ -10,6 +10,7 @@ import DevicePanel from './components/DevicePanel.vue'
 import DeathOverlay from './components/DeathOverlay.vue'
 import DisplayNameModal from './components/DisplayNameModal.vue'
 import EmergencyBanner from './components/EmergencyBanner.vue'
+import ExpBar from './components/ExpBar.vue'
 import Leaderboard from './components/Leaderboard.vue'
 import LevelUpBanner from './components/LevelUpBanner.vue'
 import MockCommandPanel from './components/MockCommandPanel.vue'
@@ -37,8 +38,10 @@ const me = computed(() => roster.value.find((p) => p.uuid === pbClient.you?.uuid
 // 场景属性 + 共享词条（经验 / 等级 / 幸运 / 经验倍率）
 const sceneState = ref<SceneState | null>(null)
 // LEVEL UP 橙色横幅（3s 动画：0.5s 缓出渐显 + 2s 停留 + 0.5s 缓入渐隐；提示期可继续攻击）
-const levelUp = ref<{ level: number } | null>(null)
+// seq 自增作为组件 key：连续升级（排队多轮）时横幅动画逐轮重启
+const levelUp = ref<{ level: number; seq: number } | null>(null)
 let levelUpTimer = 0
+let levelUpSeq = 0
 // Tab 切换：击杀排行榜 + 词条面板同展示 / 关闭
 const boardVisible = ref(true)
 function toggleBoard(e: KeyboardEvent) {
@@ -120,7 +123,7 @@ onMounted(() => {
     (st) => (pick.value = st),
     (scene) => (sceneState.value = scene),
     (level) => {
-      levelUp.value = { level }
+      levelUp.value = { level, seq: ++levelUpSeq }
       window.clearTimeout(levelUpTimer)
       levelUpTimer = window.setTimeout(() => (levelUp.value = null), 3000)
     },
@@ -234,7 +237,8 @@ onBeforeUnmount(() => {
       <Leaderboard v-if="boardVisible" :players="roster" />
       <StatPanel v-if="boardVisible" :me="me" :scene="sceneState" />
     </div>
-    <LevelUpBanner v-if="levelUp" :level="levelUp.level" />
+    <LevelUpBanner v-if="levelUp" :key="levelUp.seq" :level="levelUp.level" />
+    <ExpBar :scene="sceneState" />
     <DisplayNameModal v-if="needName" @confirm="confirmName" />
     <DeathOverlay
       v-if="dead"

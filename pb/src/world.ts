@@ -416,6 +416,8 @@ export class World {
 	tagWeights: Record<string, number> = { ...Object.fromEntries(TAG_POOL.map((t) => [t, 30])), 强化: 15 }
 	/** 升级提示期截止（level_up 后 3s 进入升级选择；提示期玩家可继续攻击） */
 	private pickStartAt = 0
+	/** 排队中的升级次数（提示期内再触发升级不会丢失，选择轮依次进行） */
+	private pendingLevels = 0
 	/** 武器裁决实例（同模块 BaseWeapon 实现：双手剑 / 苍弓，可访问下方公开的裁决方法） */
 	private weapons: Record<WeaponId, BaseWeapon> = { sword: new SwordWeapon(this), bow: new BowWeapon(this) }
 
@@ -893,10 +895,13 @@ export class World {
 
 	/** 抽 3 张增益卡牌：①权重抽标签 → ②幸运加权抽稀有度 → ③筛含该标签的卡随机（不加权） */
 	private rollCards(): GameCard[] {
+		// 抽 3 个互不重复的 (标签, 稀有度) 条件对：任一重复则整体重抽（避免重复条件浪费抽取次数）
+		let conds: { tag: string; quality: CardQuality }[]
+		do {
+			conds = Array.from({ length: 3 }, () => ({ tag: this.weightedTag(), quality: this.rollQuality() }))
+		} while (new Set(conds.map((c) => `${c.tag}|${c.quality}`)).size < 3)
 		const cards: GameCard[] = []
-		for (let i = 0; i < 3; i++) {
-			const tag = this.weightedTag()
-			const quality = this.rollQuality()
+		for (const { tag, quality } of conds) {
 			// 筛选：卡牌标签列表含指定标签即算符合；稀有度无卡时回退该标签任意稀有度，再回退全卡池
 			const exact = CARD_DB.filter((c) => c.quality === quality && c.labels.includes(tag))
 			const byTag = exact.length ? exact : CARD_DB.filter((c) => c.labels.includes(tag))
@@ -947,6 +952,9 @@ export class World {
 			pick.options[pick.choice]?.apply(this, p)
 			p.pick = null
 		}
+		this.pendingLevels = Math.max(0, this.pendingLevels - 1)
+		// 还有排队的升级 → 依次开启下一轮 LEVEL UP 提示（连续升级逐轮选择）
+		if (this.pendingLevels > 0) this.beginLevelNotice(this.now())
 	}
 
 	/** 是否处于升级（三选一）暂停阶段 */
@@ -983,9 +991,15 @@ export class World {
 		if (this.exp < threshold) return
 		this.exp = Math.round((this.exp - threshold) * 100) / 100
 		this.level++
-		// 全员 LEVEL UP 提示（PF 动画 2.5s），提示期结束（3s）后进入升级选择，期间可继续攻击
+		this.pendingLevels++
+		// 无进行中的提示 / 选择轮才开新提示；提示期内再升级只排队（不吞），选完后依次开启
+		if (this.pickStartAt === 0 && !this.pickPhase) this.beginLevelNotice(this.now())
+	}
+
+	/** 开启一轮 LEVEL UP 提示（3s 提示期可继续攻击，结束后进入升级选择） */
+	private beginLevelNotice(now: number): void {
+		this.pickStartAt = now + 3.0
 		this.events.push({ kind: 'level_up', level: this.level })
-		this.pickStartAt = this.now() + 3.0
 	}
 
 	/**
