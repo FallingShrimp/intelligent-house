@@ -15,7 +15,7 @@
  * 11. 重击剑气蓄力：hold=0.5 → 伤害 15×dmgMul；hold=2 钳到蓄力上限 1.0 → 30×dmgMul
  * 12. 暴击：critRate=1 连击全部 sign=2（伤害 ×(1+critDmg)）；critRate=0 恢复 sign=1
  * 13. 冲击力：玩家 impact=1.5 → 僵尸落手扣体 10×1.5=15
- * 14. 僵尸死亡 → 门处自动补员更强僵尸（hp 540 / dmgBonus 1）+ 三选一冻结与解除
+ * 14. 僵尸死亡 → 场景经验 100 达阈值触发升级（level_up 事件 + 3s 提示期）→ 门处补员 level+1（hp 125）→ 升级三选一冻结与解除
  * 15. 苍弓普攻：射球状闪电 → 首中附着（orb_stop target）+ 0.1s×3 伤 tick（不暴击）+ 6s TTL 到期消失
  * 16. 苍弓激光：charge_start → 0.2s×15 伤 tick（穿透双僵尸）+ 蓄力中切武器被拒 + charge_stop 停止
  * 17. 蓄满自动爆发：charge ≥ chargeDur → 40 伤一次 + chargeStartAt 清空 + 激光停止
@@ -372,6 +372,7 @@ async function main(): Promise<void> {
       const pa = world.players.get(uuidA)!
       const z = world.zombies[0]
       assert(!!pa && !!z, 'world 单例可读（A 玩家 + 僵尸存在）')
+      z.hp = 10000; z.maxHp = 10000 // 铺垫：剑气 / 连击累计伤害不击杀僵尸（死亡会触发升级三选一冻结世界）
       pa.stats.critRate = 0 // 关闭暴击，伤害断言确定化（默认 5% 暴击会污染数值）
       // A 朝 +x，僵尸摆在正前方：剑气 12m/s、10Hz tick（步长 1.2m = 命中窗口宽），
       // 与僵尸距离存在 ~7% 相位错开概率 → 未命中则重摆僵尸重射（按期望伤害过滤事件）
@@ -447,7 +448,7 @@ async function main(): Promise<void> {
     })) && ok
 
   ok =
-    (await step('僵尸死亡 → 门处自动补员更强僵尸（hp 540 / 伤害+1）+ 三选一冻结与解除', async () => {
+    (await step('僵尸死亡 → 经验达标场景升级（level_up + 3s 提示期）→ 补员 level+1（hp 125）→ 升级三选一冻结与解除', async () => {
       await sleep(400) // 攻击冷却
       // 等活僵尸进入 A 攻击距离（REACH 3.0）
       await waitWorld(a, (w) => {
@@ -460,17 +461,31 @@ async function main(): Promise<void> {
       send(a, 'mp_action', nextSeq(), { kind: 'attack', segment: 0 })
       const die = await recvWhere(a, (m) => m.type === 'event' && m.payload.kind === 'zdie' && m.payload.id === z0.id, 'zdie 事件')
       assert(die.payload.id === z0.id, `被击杀僵尸 id=${z0.id}`)
-      // 三选一开启 + 快照携带补员 max_hp=540（PF 血条比例分母）
-      await waitWorld(a, (w) => w.pick_phase === true && w.zombies.some((z: AnyMsg) => z.max_hp === 540), 'pick_phase 开启 + max_hp=540')
-      // 补员：门处（ZOMBIE_SPAWN -4.55,1.9）生成 hp=500+40、dmgBonus=1 的更强僵尸
+      // 经验结算：击杀 0 级僵尸 → 场景经验 +100×经验倍率(1) = 阈值 100+0×75 → 立即升级（exp 清零 / level=1）
+      const lu = await recvWhere(a, (m) => m.type === 'event' && m.payload.kind === 'level_up', 'level_up 事件')
+      assert(lu.payload.level === 1, `场景等级升至 1（实际 ${lu.payload.level}）`)
+      await waitWorld(a, (w) => w.scene.level === 1 && w.scene.exp === 0, '快照 scene：level=1 / exp=0')
+      // 补员：门处生成 level+1 僵尸（hp = 100+25×1 = 125）
       const z1 = world.zombies.find((x) => x.id !== z0.id)
       assert(z1 !== undefined, '补员僵尸已生成')
-      assert(z1!.hp === 540, `补员血量上限 = 500+40（实际 ${z1!.hp}）`)
-      assert(z1!.dmgBonus === 1, `补员伤害加成 +1（实际 ${z1!.dmgBonus}）`)
-      assert(z1!.x === -4.55 && z1!.z === 1.9, `补员出生在门处（实际 ${z1!.x},${z1!.z}）`)
-      // A 选择增益 → 解除冻结（确定性：选自己抽中的第一项，idx 0 不一定在 options 里）
-      send(a, 'mp_action', nextSeq(), { kind: 'pick', idx: world.players.get(uuidA)!.pick!.options[0] })
+      assert(z1!.level === 1, `补员僵尸等级 = 上一只 +1（实际 ${z1!.level}）`)
+      assert(z1!.hp === 125 && z1!.maxHp === 125, `补员血量 = 100+25×1（实际 ${z1!.hp}/${z1!.maxHp}）`)
+      assert(z1!.x === -4.55 || Math.hypot(z1!.x - -4.55, z1!.z - 1.9) < 0.5, `补员出生在门处（提示期内已起步，容差 0.5m；实际 ${z1!.x},${z1!.z}）`)
+      // 3s LEVEL UP 提示期内世界不冻结（可继续攻击），到期 → 进入升级三选一
+      await sleep(400)
+      assert(world.players.get(uuidA)!.pick === null, '提示期内尚未进入三选一')
+      await waitWorld(a, (w) => w.pick_phase === true, '提示期结束 → pick_phase 开启', 5000)
+      const pickSt = world.players.get(uuidA)!.pick!
+      assert(pickSt !== null && pickSt.options.length === 3, '全员独立抽到 3 张增益卡牌')
+      // A 选择第一张卡 → 房间内仅 A → 全员选完即结算并解除冻结
+      send(a, 'mp_action', nextSeq(), { kind: 'pick', idx: 0 })
       await waitWorld(a, (w) => w.pick_phase === false, 'pick_phase 解除')
+      assert(world.players.get(uuidA)!.pick === null, '选择结算后 pick 状态清空')
+      // 确定性：重置可能被卡牌改动的词条，避免污染后续伤害断言（暴击率 / 伤害倍率 / 攻击力）
+      const pa = world.players.get(uuidA)!
+      pa.stats.critRate = 0
+      pa.stats.dmgMul = 1
+      pa.stats.atk = 10
     })) && ok
 
   // ---------- 用例 15-19：苍弓（球状闪电 / 巨型激光，PB 权威裁决） ----------
@@ -478,6 +493,7 @@ async function main(): Promise<void> {
   ok =
     (await step('苍弓普攻：射球状闪电 → 首中附着 + 0.1s×3 伤 tick（不暴击）+ 6s TTL 到期消失', async () => {
       const z = world.zombies.find((x) => x.state !== 'dead')!
+      z.hp = 10000; z.maxHp = 10000 // 铺垫：多段 tick 不击杀僵尸（死亡会触发升级三选一冻结世界）
       // A 切换苍弓（快照回写）
       send(a, 'mp_action', nextSeq(), { kind: 'weapon', weapon: 'bow' })
       await waitWorld(a, (w) => w.players.find((p: AnyMsg) => p.uuid === uuidA)?.weapon === 'bow', 'A weapon=bow')
@@ -512,6 +528,7 @@ async function main(): Promise<void> {
       await waitWorld(a, (w) => w.zombies.some((x: AnyMsg) => x.id !== world.zombies[0].id && x.state === 'chase'), '第二只僵尸 chase')
       const zs = world.zombies.filter((x) => x.state !== 'dead')
       for (const z of zs) z.vulnMul = 0 // 确定性：清掉可能的眩晕易伤倍率（伤害断言为固定值）
+      for (const z of zs) { z.hp = 10000; z.maxHp = 10000 } // 铺垫：激光多段 tick 不击杀僵尸
       input(a, [-3.0, 1.6, 1.9], [1, 0], 'fp')
       await sleep(150)
       zs[0].x = 0.5; zs[0].z = 1.9
@@ -539,6 +556,7 @@ async function main(): Promise<void> {
       pa.hp = 100; pa.stamina = 100; pa.stunUntil = 0; pa.exhaustUntil = 0; pa.guardBreakUntil = 0
       const zs = world.zombies.filter((x) => x.state !== 'dead')
       for (const z of zs) z.vulnMul = 0
+      for (const z of zs) { z.hp = 10000; z.maxHp = 10000 } // 铺垫：40 伤爆发 / 残留 tick 不击杀僵尸
       input(a, [-3.0, 1.6, 1.9], [1, 0], 'fp')
       await sleep(150)
       zs[0].x = 2.5; zs[0].z = 1.9

@@ -56,7 +56,7 @@ export interface CombatHud {
 	/** 当前武器 ID 与名称（HUD 展示） */
 	weapon: WeaponId
 	weaponName: string
-	target: { hp: number; maxHp: number; stamina: number; maxStamina: number; vulnMul: number } | null
+	target: { hp: number; maxHp: number; stamina: number; maxStamina: number; vulnMul: number; level: number } | null
 }
 
 /** 武器普攻上下文（编排器每次点击时组装） */
@@ -80,6 +80,8 @@ export interface AttackCtx {
  */
 export abstract class BaseWeapon {
 	abstract weaponName: string
+	/** 普攻最小间隔（秒）：两次普攻之间的冷却（PB 权威裁决，PF 侧镜像声明） */
+	abstract attackTime: number
 	protected readonly c: PlayerCombat
 	protected constructor(c: PlayerCombat) {
 		this.c = c
@@ -87,6 +89,8 @@ export abstract class BaseWeapon {
 	abstract attach(camera: THREE.Camera): void
 	abstract setVisible(v: boolean): void
 	abstract normalAttack(now: number, ctx: AttackCtx): boolean
+	/** 格挡起手（右键按下）：是否成功进入格挡（武器自行决定是否支持，如苍弓不可格挡） */
+	abstract parry(now: number): boolean
 	abstract startCharge(now: number): boolean
 	abstract heavyAttack(timeCharged: number, now: number): boolean
 	abstract maxChargeReached(now: number): boolean
@@ -111,7 +115,7 @@ const REACH_ANGLE = 0.55
 const COUNTER_REACH = 3.4
 
 /** 武器名（HUD 显示 / 切换提示） */
-export const WEAPON_NAMES: Record<WeaponId, string> = { sword: '双手剑', bow: '苍弓' }
+export const WEAPON_NAMES: Record<WeaponId, string> = { sword: '无锋剑', bow: '苍弓' }
 /** 武器循环顺序（Q = 上一把 / E = 下一把） */
 const WEAPON_CYCLE: WeaponId[] = ['sword', 'bow']
 
@@ -215,10 +219,10 @@ export class PlayerCombat {
 	/** 重击蓄力开始（本地 loop 秒；>=0 表示蓄力中——剑 / 弓共用编排层状态） */
 	chargeStart = -1
 
-	private stunUntilLocal = 0  // loop 秒钟基准的眩晕截止（快照 stun_for 折算）
+	stunUntilLocal = 0  // loop 秒钟基准的眩晕截止（快照 stun_for 折算）
 	private guardBreakUntil = 0
-	private blockStart = 0
-	private blockCdUntil = 0
+	blockStart = 0
+	blockCdUntil = 0
 	private hudEmit = 0
 	private now = 0
 	private chargeNotified = false // 蓄满提示音已播
@@ -368,15 +372,9 @@ export class PlayerCombat {
 		return WEAPON_CYCLE[((i + dir) % n + n) % n]
 	}
 
+	/** 格挡起手：委托当前武器（无锋剑举盾，苍弓不可格挡返回 false） */
 	startBlock(now: number): boolean {
-		if (this.hp <= 0) return false
-		if (this.stunUntilLocal > now || this.blocking || now < this.blockCdUntil) return false
-		if (now < this.guardBreakUntil) return false
-		this.blocking = true
-		this.blockStart = now
-		pbClient.sendMpAction({ kind: 'parry_start' })
-		this.emitHud(true)
-		return true
+		return this.weapon.parry(now)
 	}
 
 	endBlock(now: number) {
@@ -384,6 +382,18 @@ export class PlayerCombat {
 		this.blocking = false
 		this.blockCdUntil = now + BLOCK_CD_S
 		pbClient.sendMpAction({ kind: 'parry_stop' })
+		this.emitHud(true)
+	}
+
+	/**
+	 * PB parry 事件回写（格挡结果权威）：
+	 * 任意成功格挡 → 立即退出格挡姿态；普通格挡进入冷却（完美格挡冷却完毕可立即再格挡）。
+	 */
+	onParryJudged(perfect: boolean) {
+		if (!this.blocking) return
+		this.blocking = false
+		this.blockStart = 0
+		if (!perfect) this.blockCdUntil = this.now + BLOCK_CD_S
 		this.emitHud(true)
 	}
 
@@ -459,7 +469,7 @@ export class PlayerCombat {
 				? incoming.state === 'sweep' ? 'sweep' : incoming.state === 'lungeWind' ? 'lunge' : 'normal'
 				: null,
 			target: t
-				? { hp: t.hp, maxHp: t.maxHp, stamina: t.stamina, maxStamina: t.maxStamina, vulnMul: t.vulnMul }
+				? { hp: t.hp, maxHp: t.maxHp, stamina: t.stamina, maxStamina: t.maxStamina, vulnMul: t.vulnMul, level: t.level }
 				: null,
 		}
 	}
@@ -506,7 +516,7 @@ export class PlayerCombat {
 		return best
 	}
 
-	private emitHud(force = false) {
+	emitHud(force = false) {
 		if (force) this.hudEmit = this.now
 		this.hooks.onHud()
 	}
@@ -515,13 +525,25 @@ export class PlayerCombat {
 /** 编排器蓄力状态由武器读写（剑蓄力姿态 / 苍弓拉弓姿态共用） */
 export interface ChargeStateHost extends PlayerCombat {}
 
-// ---------------- 双手剑（现攻击逻辑解耦，行为不变） ----------------
+/** 无锋剑（原双手剑）：现攻击逻辑解耦，行为不变 */
 
 class SwordWeapon extends BaseWeapon {
-	weaponName = '双手剑'
+	weaponName = '无锋剑'
+	attackTime = 0.3
 
 	constructor(c: PlayerCombat) {
 		super(c)
+	}
+
+	/** 举盾格挡：死亡 / 眩晕 / 已格挡 / 格挡冷却 / 破防中拒绝；成功进入格挡并上报 parry_start */
+	parry(now: number): boolean {
+		const c = this.c
+		if (!c.canAct(now) || c.blocking || now < c.blockCdUntil) return false
+		c.blocking = true
+		c.blockStart = now
+		pbClient.sendMpAction({ kind: 'parry_start' })
+		c.emitHud(true)
+		return true
 	}
 
 	private sword: THREE.Group | null = null
@@ -830,9 +852,15 @@ const BOW_SHOOT: SwingDef = {
 
 class BowWeapon extends BaseWeapon {
 	weaponName = '苍弓'
+	attackTime = 0.3
 
 	constructor(c: PlayerCombat) {
 		super(c)
+	}
+
+	/** 苍弓不可格挡 */
+	parry(_now: number): boolean {
+		return false
 	}
 
 	private bow: THREE.Group | null = null

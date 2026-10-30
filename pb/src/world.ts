@@ -16,11 +16,12 @@
 
 // ---------------- 常量（与 PF 单机版对齐） ----------------
 
-const Z_MAX_HP = 500
+/** 僵尸血量：100 + 25×等级（台灯召唤为 0 级，死亡后补员等级 +1） */
+const Z_BASE_HP = 100
+const Z_HP_PER_LEVEL = 25
+/** 僵尸伤害成长：所有攻击伤害 +0.25×等级 */
+const Z_DMG_PER_LEVEL = 0.25
 const Z_MAX_ST = 100
-/** 补员僵尸世代递进：每代血量上限 +40 / 伤害 +1（僵尸死亡后自动在门处召唤） */
-const Z_TIER_HP = 40
-const Z_TIER_DMG = 1
 const Z_CHASE_SPEED = 0.95
 const Z_ENTER_SPEED = 1.0
 const Z_ATTACK_RANGE = 1.7
@@ -60,10 +61,12 @@ const SWEEP_TRACK_S = 8
 const REACH = 3.0
 const REACH_ANGLE = 0.55
 const COUNTER_REACH = 3.4
-const ATTACK_MIN_INTERVAL = 0.3 // 服务端攻击最小间隔（防刷）
 const MAX_ZOMBIES = 3
 const ZOMBIE_TTL_DEAD = 2.0
 const ZOMBIE_SPAWN = { x: -4.55, z: 1.9 }
+
+/** 增益卡牌标签池（初始抽取权重均 30；「出现[X]卡牌的概率提高」卡牌使对应标签权重 +10） */
+const TAG_POOL = ['通用', '生存', '暴击', '专精-无锋剑', '专精-苍弓', '专精-圣金源盾', '专精-星尘溶液', '专精-AK47']
 
 // 重击剑气（远程弹道）
 const WAVE_SPEED = 12     // m/s
@@ -141,10 +144,49 @@ const STAT_DEFAULTS: Record<StatKey, number> = {
 	huaqi: 0.3, def: 10,
 }
 
-/** 百分比词条：加值后 ×100 取整防浮漂 */
-const PCT_STAT_KEYS: ReadonlySet<StatKey> = new Set([
-	'parryPct', 'dmgMul', 'chargeSpd', 'thorn', 'impact', 'stability', 'critRate', 'critDmg', 'huaqi',
-])
+/** 词条数据格式：决定展示方式与取整规则（PERCENT ×100 取整防浮漂） */
+export enum DataFormat {
+	INT = 'INT',
+	VALUE = 'VALUE',
+	PERCENT = 'PERCENT',
+	FREQUENCY = 'FREQUENCY',
+	ANGLE = 'ANGLE',
+}
+
+/** 词条定义：format 决定格式化，name 为展示名，after 为值变更后的钩子（如上限变化回补当前值） */
+interface StatDef {
+	format: DataFormat
+	name: string
+	/** 词条值变更后触发（p = 词条所属玩家，old = 变更前的值） */
+	after?: (p: MpPlayer, old: number) => void
+}
+
+/** 玩家词条数据库（键 = statStore 即 MpPlayer.stats 的键） */
+const STAT_DEFS: Record<StatKey, StatDef> = {
+	atk: { format: DataFormat.VALUE, name: '攻击力' },
+	maxHp: {
+		format: DataFormat.VALUE, name: '生命上限',
+		after: (p, old) => { if (old > 0) p.hp = Math.round((p.hp / old) * p.stats.maxHp) }, // 当前生命按比例回补
+	},
+	maxSt: {
+		format: DataFormat.VALUE, name: '体力上限',
+		after: (p, old) => { if (old > 0) p.stamina = Math.round((p.stamina / old) * p.stats.maxSt) },
+	},
+	parryPct: { format: DataFormat.PERCENT, name: '完美格挡窗口', after: (p) => { p.stats.parryPct = Math.min(1, p.stats.parryPct) } },
+	blockMaxS: { format: DataFormat.VALUE, name: '格挡最大持续' },
+	dmgMul: { format: DataFormat.PERCENT, name: '伤害倍率' },
+	chargeSpd: { format: DataFormat.PERCENT, name: '蓄力速度' },
+	chargeMax: { format: DataFormat.VALUE, name: '蓄力上限' },
+	thorn: { format: DataFormat.PERCENT, name: '荆棘' },
+	lifesteal: { format: DataFormat.VALUE, name: '吸血' },
+	multiWave: { format: DataFormat.INT, name: '连续剑气' },
+	impact: { format: DataFormat.PERCENT, name: '冲击力' },
+	stability: { format: DataFormat.PERCENT, name: '稳定性' },
+	critRate: { format: DataFormat.PERCENT, name: '暴击率', after: (p) => { p.stats.critRate = Math.min(1, p.stats.critRate) } },
+	critDmg: { format: DataFormat.PERCENT, name: '暴击伤害' },
+	huaqi: { format: DataFormat.PERCENT, name: '化气' },
+	def: { format: DataFormat.VALUE, name: '防御' },
+}
 
 /** 三选一增益选项（表驱动） */
 interface PickOption {
@@ -169,7 +211,44 @@ export interface DamageSource {
 	impact: number        // 受击者扣除的体力基值（T2b 冲击力/稳定性公式挂点）
 }
 
-/** 武器 ID：双手剑 / 苍弓 */
+/** 卡牌稀有度：决定抽取权重与 PF 展示样式 */
+export enum CardQuality {
+	WASTE = 'WASTE',
+	NORMAL = 'NORMAL',
+	RARE = 'RARE',
+	EPIC = 'EPIC',
+	LEGENDARY = 'LEGENDARY',
+	INFINITY = 'INFINITY',
+}
+
+/** 稀有度参数：初始抽取权重 + 幸运加权（实际权重 = max(1, 初始 + 场景幸运 × 加权)） */
+export const QUALITY_META: Record<CardQuality, { init: number; luckAdj: number }> = {
+	[CardQuality.WASTE]: { init: 50, luckAdj: -5 },
+	[CardQuality.NORMAL]: { init: 100, luckAdj: -3 },
+	[CardQuality.RARE]: { init: 60, luckAdj: 0 },
+	[CardQuality.EPIC]: { init: 20, luckAdj: 3 },
+	[CardQuality.LEGENDARY]: { init: 8, luckAdj: 4 },
+	[CardQuality.INFINITY]: { init: 1, luckAdj: 5 },
+}
+
+/** 增益卡牌：labels 为标签列表（决定抽取路径），apply 为选中后的结算（词条卡 / 场景词条卡 / 标签权重卡） */
+export interface GameCard {
+	id: string
+	label: string
+	labels: string[]
+	quality: CardQuality
+	apply: (world: World, p: MpPlayer) => void
+}
+
+/** 快照中的卡牌选项（PF 渲染投影，不含 apply 函数） */
+export interface PickCardView {
+	id: string
+	label: string
+	quality: CardQuality
+	labels: string[]
+}
+
+/** 武器 ID：无锋剑 / 苍弓 */
 export type WeaponId = 'sword' | 'bow'
 
 export interface MpPlayer {
@@ -208,8 +287,10 @@ export interface MpPlayer {
 	waveNextAt: number
 	/** 苍弓持续激光下一 tick 时刻（epoch 秒；chargeStartAt >= 0 时每 0.2s 结算） */
 	beamNextAt: number
-	/** 三选一选择状态（进行中时非空）：随机 3 个选项索引 + 已选 */
-	pick: { options: number[]; choice: number | null } | null
+	/** 闪避无敌帧截止（外部触发带无敌的闪避上报 'dash' 后 0.3s 免伤） */
+	dashInvulnUntil: number
+	/** 升级选择状态（进行中时非空）：抽到的 3 张增益卡牌 + 已选索引 */
+	pick: { options: GameCard[]; choice: number | null } | null
 	/** 下落攻击判定：由 10Hz 位置差分推导的垂直速度 m/s */
 	vy: number
 	lastY: number
@@ -222,11 +303,11 @@ export interface MpZombie {
 	x: number; y: number; z: number
 	yaw: number
 	hp: number
-	/** 血量上限（补员世代递增：Z_MAX_HP + 40×世代），快照 max_hp 供 PF 血条比例 */
+	/** 血量上限（100 + 25×等级），快照 max_hp 供 PF 血条比例 */
 	maxHp: number
 	stamina: number
-	/** 伤害加成（补员世代：strike/sweep/lunge 基础伤害 + 此值） */
-	dmgBonus: number
+	/** 僵尸等级（第几代）：台灯召唤 = 0，死亡补员 = 上一只等级 +1 */
+	level: number
 	state: ZState
 	stT: number          // 当前状态已持续秒数
 	windupDur: number    // 前摇总时长（windup/sweep/lungeWind/roar）
@@ -255,6 +336,8 @@ export type MpEvent =
 	| { kind: 'parry'; uuid: string; perfect: boolean; fail: boolean; drain: number; byZombie: boolean }
 	| { kind: 'zstun'; id: number; mul: number }
 	| { kind: 'zdie'; id: number }
+	/** 场景升级（经验达阈值）：全员 LEVEL UP 提示，提示期结束进入升级（三选一）阶段 */
+	| { kind: 'level_up'; level: number }
 	| { kind: 'knockback'; uuid: string; dx: number; dz: number; speed: number }
 	| { kind: 'slow'; uuid: string; dur: number }
 	| { kind: 'guardbreak'; uuid: string; dur: number }
@@ -273,6 +356,8 @@ export interface WorldSnapshot {
 	t: number
 	chase_left: number
 	pick_phase: boolean
+	/** 场景共享词条与属性（幸运 / 经验倍率为词条，经验 / 等级为属性） */
+	scene: { exp: number; level: number; luck: number; exp_mul: number }
 	players: {
 		uuid: string; name: string; color: string
 		p: [number, number, number]; yaw: number
@@ -288,12 +373,14 @@ export interface WorldSnapshot {
 		impact: number; stability: number
 		crit_rate: number; crit_dmg: number
 		weapon: WeaponId
-		pick: { options: number[]; done: boolean } | null
+		pick: { options: PickCardView[]; done: boolean } | null
 	}[]
 	zombies: {
 		id: number
 		p: [number, number, number]; yaw: number
 		hp: number; st: number
+		/** 僵尸等级（第几代） */
+		level: number
 		state: ZState; st_t: number; windup_dur: number
 		vuln: number
 		target: boolean
@@ -314,8 +401,19 @@ export class World {
 	events: MpEvent[] = []
 	private byWs = new Map<string, string>() // wsId → uuid
 	private zSeq = 0
-	/** 补员世代：每只僵尸死亡 +1（决定补员僵尸的血量/伤害递进） */
-	private zTier = 0
+	// ---- 场景共享词条（幸运 / 经验倍率）与场景属性（经验 / 等级，非词条） ----
+	/** 幸运（VALUE，初始 1）：影响卡牌稀有度抽取权重 */
+	luck = 1
+	/** 经验倍率（PERCENT，初始 1 = 100%）：僵尸死亡经验结算倍率 */
+	expMul = 1
+	/** 场景当前经验值（VALUE，初始 0） */
+	exp = 0
+	/** 场景等级（INT，初始 0） */
+	level = 0
+	/** 标签抽取权重（标签池初始均 30，「出现[X]卡牌的概率提高」卡牌 +10） */
+	tagWeights: Record<string, number> = Object.fromEntries(TAG_POOL.map((t) => [t, 30]))
+	/** 升级提示期截止（level_up 后 3s 进入升级选择；提示期玩家可继续攻击） */
+	private pickStartAt = 0
 	/** 武器裁决实例（同模块 BaseWeapon 实现：双手剑 / 苍弓，可访问下方公开的裁决方法） */
 	private weapons: Record<WeaponId, BaseWeapon> = { sword: new SwordWeapon(this), bow: new BowWeapon(this) }
 
@@ -340,6 +438,7 @@ export class World {
 			stats: { ...STAT_DEFAULTS },
 			weapon: 'sword', chargeStartAt: -1,
 			waveQueue: 0, waveNextAt: 0, beamNextAt: 0,
+			dashInvulnUntil: 0,
 			pick: null,
 			vy: 0, lastY: 1.6, lastInputAt: 0,
 			blockTimes: [],
@@ -391,7 +490,7 @@ export class World {
 		}
 	}
 
-	action(uuid: string, d: { kind: 'attack' | 'parry_start' | 'parry_stop' | 'respawn' | 'wave' | 'pick' | 'revive' | 'lamp' | 'weapon' | 'shoot' | 'charge_start' | 'charge_stop'; segment?: number; hold?: number; idx?: number; target?: string; weapon?: WeaponId }): void {
+	action(uuid: string, d: { kind: 'attack' | 'parry_start' | 'parry_stop' | 'respawn' | 'wave' | 'pick' | 'revive' | 'lamp' | 'weapon' | 'shoot' | 'charge_start' | 'charge_stop' | 'dash'; segment?: number; hold?: number; idx?: number; target?: string; weapon?: WeaponId }): void {
 		const p = this.players.get(uuid)
 		if (!p) return
 		const now = this.now()
@@ -408,16 +507,20 @@ export class World {
 			if (p.mode === 'fp') this.maybeSpawnZombie()
 			return
 		}
+		// 闪避（PF 外部触发且带无敌参数时上报）：短暂无敌帧（0.3s 完全免伤）
+		if (d.kind === 'dash') {
+			p.dashInvulnUntil = now + 0.3
+			return
+		}
 		// 武器切换：蓄力中拒绝，其余即时生效（快照回写为准）
 		if (d.kind === 'weapon') {
 			if (!d.weapon || p.chargeStartAt >= 0) return
 			p.weapon = d.weapon
 			return
 		}
+		// 格挡起手：由当前武器的 parry 行为决定（无锋剑举盾格挡，苍弓不可格挡）
 		if (d.kind === 'parry_start') {
-			if (p.stunUntil > now || p.blocking || now < p.blockCdUntil || now < p.guardBreakUntil) return
-			p.blocking = true
-			p.blockStart = now
+			this.weapons[p.weapon].parry(p, now)
 			return
 		}
 		if (d.kind === 'parry_stop') {
@@ -747,10 +850,10 @@ export class World {
 			z.deadAt = this.now()
 			by.kills++
 			this.events.push({ kind: 'zdie', id: z.id })
-			// 门处自动补员更强僵尸：世代 +1（血量上限 +40 / 伤害 +1）
-			this.zTier++
-			this.spawnZombie(Z_TIER_HP * this.zTier, Z_TIER_DMG * this.zTier)
-			this.startPickPhase()
+			// 经验结算（场景属性）：达到阈值即场景升级，提示期结束后全员进入升级选择
+			this.gainExp(z.level)
+			// 门处自动补员下一世代僵尸（等级 +1：血量 / 伤害随等级成长）
+			this.spawnZombie(z.level + 1)
 		}
 	}
 
@@ -777,15 +880,53 @@ export class World {
 		{ label: '防御 +30', key: 'def', add: 30 },
 	]
 
-	/** 僵尸被击败：房间内所有第一人称玩家进入三选一（每人独立随机抽 3 项） */
+	/** 僵尸被击败：房间内所有第一人称玩家进入升级（三选一，每人独立抽 3 张卡牌） */
 	private startPickPhase(): void {
 		const inRoom = [...this.players.values()].filter((q) => q.mode === 'fp')
 		if (!inRoom.length) return
-		const pool = World.PICK_OPTIONS.map((_, i) => i)
 		for (const p of inRoom) {
-			const shuffled = [...pool].sort(() => Math.random() - 0.5)
-			p.pick = { options: shuffled.slice(0, 3), choice: null }
+			p.pick = { options: this.rollCards(), choice: null }
 		}
+	}
+
+	/** 抽 3 张增益卡牌：①权重抽标签 → ②幸运加权抽稀有度 → ③筛含该标签的卡随机（不加权） */
+	private rollCards(): GameCard[] {
+		const cards: GameCard[] = []
+		for (let i = 0; i < 3; i++) {
+			const tag = this.weightedTag()
+			const quality = this.rollQuality()
+			// 筛选：卡牌标签列表含指定标签即算符合；稀有度无卡时回退该标签任意稀有度，再回退全卡池
+			const exact = CARD_DB.filter((c) => c.quality === quality && c.labels.includes(tag))
+			const byTag = exact.length ? exact : CARD_DB.filter((c) => c.labels.includes(tag))
+			const pool = byTag.length ? byTag : CARD_DB
+			cards.push(pool[Math.floor(Math.random() * pool.length)])
+		}
+		return cards
+	}
+
+	/** 按标签权重抽 1 个标签（权重越大越容易被抽到） */
+	private weightedTag(): string {
+		const entries = Object.entries(this.tagWeights).filter(([, w]) => w > 0)
+		const total = entries.reduce((s, [, w]) => s + w, 0)
+		let r = Math.random() * total
+		for (const [tag, w] of entries) {
+			r -= w
+			if (r <= 0) return tag
+		}
+		return entries[entries.length - 1]?.[0] ?? TAG_POOL[0]
+	}
+
+	/** 按幸运加权抽 1 个稀有度：权重 = max(1, 初始权重 + 场景幸运 × 幸运加权) */
+	private rollQuality(): CardQuality {
+		const entries = Object.entries(QUALITY_META) as [CardQuality, { init: number; luckAdj: number }][]
+		const weights = entries.map(([, m]) => Math.max(1, m.init + this.luck * m.luckAdj))
+		const total = weights.reduce((s, w) => s + w, 0)
+		let r = Math.random() * total
+		for (let i = 0; i < entries.length; i++) {
+			r -= weights[i]
+			if (r <= 0) return entries[i][0]
+		}
+		return CardQuality.NORMAL
 	}
 
 	/** 全员是否已选完 */
@@ -796,27 +937,17 @@ export class World {
 		return true
 	}
 
-	/** 应用增益并结束选择阶段（表驱动；maxHp/maxSt 按比例回补当前值，百分比词条 ×100 取整防浮漂） */
+	/** 应用所选卡牌并结束升级阶段（钩子回补当前生命 / 体力，概率词条封顶由 STAT_DEFS.after 处理） */
 	private applyPicks(): void {
 		for (const p of this.players.values()) {
 			const pick = p.pick
 			if (!pick || pick.choice === null) continue
-			const opt = World.PICK_OPTIONS[pick.choice]
-			const backfillFrom = opt.key === 'maxHp' ? p.stats.maxHp : opt.key === 'maxSt' ? p.stats.maxSt : 0
-			const cur = p.stats[opt.key]
-			p.stats[opt.key] = PCT_STAT_KEYS.has(opt.key)
-				? Math.round((cur + opt.add) * 100) / 100
-				: cur + opt.add
-			// 上限类：当前值按原比例回补（血量 / 体力百分比不变）
-			if (opt.key === 'maxHp') p.hp = Math.round((p.hp / backfillFrom) * p.stats.maxHp)
-			if (opt.key === 'maxSt') p.stamina = Math.round((p.stamina / backfillFrom) * p.stats.maxSt)
-			// 概率词条封顶 100%
-			if (opt.key === 'parryPct' || opt.key === 'critRate') p.stats[opt.key] = Math.min(1, p.stats[opt.key])
+			pick.options[pick.choice]?.apply(this, p)
 			p.pick = null
 		}
 	}
 
-	/** 是否处于三选一暂停阶段 */
+	/** 是否处于升级（三选一）暂停阶段 */
 	get pickPhase(): boolean {
 		for (const p of this.players.values()) {
 			if (p.mode === 'fp' && p.pick) return true
@@ -824,13 +955,35 @@ export class World {
 		return false
 	}
 
-	/** 三选一选择（PF 上报选项索引） */
+	/** 升级选择（PF 上报选项索引 0-2） */
 	pickChoose(uuid: string, idx: number): void {
 		const p = this.players.get(uuid)
 		if (!p?.pick || p.pick.choice !== null) return
-		if (!p.pick.options.includes(idx)) return
+		if (idx < 0 || idx >= p.pick.options.length) return
 		p.pick.choice = idx
 		if (this.pickDone()) this.applyPicks()
+	}
+
+	/** 词条变更统一入口：按 DataFormat 取整（PERCENT ×100 防浮漂）并触发词条钩子 */
+	applyStatChange(p: MpPlayer, key: StatKey, add: number): void {
+		const def = STAT_DEFS[key]
+		const old = p.stats[key]
+		p.stats[key] = def.format === DataFormat.PERCENT
+			? Math.round((old + add) * 100) / 100
+			: old + add
+		def.after?.(p, old)
+	}
+
+	/** 僵尸死亡经验结算：场景经验 += (100 + 50×僵尸等级) × 经验倍率；达阈值 → 消耗并场景升级 */
+	private gainExp(zLevel: number): void {
+		this.exp = Math.round((this.exp + (100 + 50 * zLevel) * this.expMul) * 100) / 100
+		const threshold = 100 + this.level * 75
+		if (this.exp < threshold) return
+		this.exp = Math.round((this.exp - threshold) * 100) / 100
+		this.level++
+		// 全员 LEVEL UP 提示（PF 动画 2.5s），提示期结束（3s）后进入升级选择，期间可继续攻击
+		this.events.push({ kind: 'level_up', level: this.level })
+		this.pickStartAt = this.now() + 3.0
 	}
 
 	/**
@@ -838,7 +991,7 @@ export class World {
 	 * 返回错误信息（null = 成功）。
 	 */
 	reviveBy(byUuid: string, targetUuid: string): string | null {
-		if (this.pickPhase) return '选择增益后才能复活队友'
+		if (this.pickPhase) return '升级选择完成后才能复活队友'
 		const by = this.players.get(byUuid)
 		const t = this.players.get(targetUuid)
 		if (!by || !t) return '目标不存在'
@@ -857,9 +1010,14 @@ export class World {
 		return null
 	}
 
-	/** 对玩家造成伤害：格挡评估 → 扣血 → 死亡重生（PVP 与僵尸攻击共用；武器实例可访问） */
+	/** 对玩家造成伤害：闪避无敌帧 / 格挡评估 → 扣血 → 死亡重生（PVP 与僵尸攻击共用；武器实例可访问） */
 	damagePlayer(v: MpPlayer, dmg: DamageSource, by: MpPlayer | null, now: number, fromZombie: boolean, isWave = false): void {
 		if (v.hp <= 0) return
+		// 闪避无敌帧：完全免伤（dmg_p sign=Blocked 供 PF 飘「格挡」字样）
+		if (now < v.dashInvulnUntil) {
+			this.events.push({ kind: 'dmg_p', uuid: v.uuid, amount: 0, sign: DamageSign.Blocked, by: dmg.from, interrupt: false })
+			return
+		}
 		if (v.stunUntil > now) {
 			if (isWave) this.useStamina(v, dmg.impact, now, by) // 被剑气命中扣体力
 			this.hurtPlayer(v, dmg, now, by)
@@ -877,6 +1035,7 @@ export class World {
 				this.perfectParryHeal(v, dmg)
 				this.events.push({ kind: 'parry', uuid: v.uuid, perfect: true, fail: false, drain: 20, byZombie: fromZombie })
 				this.registerBlock(v, now)
+				this.endBlockSuccess(v, now, true) // 退出格挡且不进冷却（可立即再格挡）
 				return
 			}
 			if (Math.random() < 0.25) {
@@ -888,15 +1047,28 @@ export class World {
 			const drained = this.useStamina(v, dmg.impact, now, by)
 			this.events.push({ kind: 'parry', uuid: v.uuid, perfect: false, fail: false, drain: Math.round(drained * 100) / 100, byZombie: fromZombie })
 			this.registerBlock(v, now)
+			this.endBlockSuccess(v, now, false) // 退出格挡并进入冷却
 			return
 		}
 		if (isWave) this.useStamina(v, dmg.impact, now, by) // 被剑气命中扣体力
 		this.hurtPlayer(v, dmg, now, by)
 	}
 
+	/** 成功格挡统一收尾：立即退出格挡状态；完美格挡不进冷却，普通格挡进入冷却 */
+	private endBlockSuccess(v: MpPlayer, now: number, perfect: boolean): void {
+		v.blocking = false
+		v.blockStart = 0
+		if (!perfect) v.blockCdUntil = now + BLOCK_CD_S
+	}
+
 	/** 僵尸攻击玩家（含完美格挡对僵尸的反噬：-20 体力 + 踉跄） */
 	private damagePlayerByZombie(z: MpZombie, v: MpPlayer, dmg: DamageSource, now: number): void {
 		if (v.hp <= 0) return
+		// 闪避无敌帧：完全免伤
+		if (now < v.dashInvulnUntil) {
+			this.events.push({ kind: 'dmg_p', uuid: v.uuid, amount: 0, sign: DamageSign.Blocked, by: dmg.from, interrupt: false })
+			return
+		}
 		if (v.stunUntil > now) {
 			this.hurtPlayer(v, dmg, now, null, z)
 			return
@@ -911,6 +1083,7 @@ export class World {
 				this.events.push({ kind: 'parry', uuid: v.uuid, perfect: true, fail: false, drain: 20, byZombie: true })
 				if (drained) this.zombieStun(z, now)
 				this.registerBlock(v, now)
+				this.endBlockSuccess(v, now, true) // 完美格挡：退出且不进冷却
 				return
 			}
 			if (Math.random() < 0.25) {
@@ -921,6 +1094,7 @@ export class World {
 			this.useStamina(v, dmg.impact, now, z)
 			this.events.push({ kind: 'parry', uuid: v.uuid, perfect: false, fail: false, drain: 10, byZombie: true })
 			this.registerBlock(v, now)
+			this.endBlockSuccess(v, now, false) // 普通格挡：退出并进入冷却
 			return
 		}
 		this.hurtPlayer(v, dmg, now, null)
@@ -1030,17 +1204,19 @@ export class World {
 	private maybeSpawnZombie(): void {
 		const alive = this.zombies.filter((z) => z.state !== 'dead').length
 		if (alive >= MAX_ZOMBIES) return
-		this.spawnZombie(0, 0)
+		this.spawnZombie(0) // 台灯召唤：0 级僵尸
 	}
 
-	/** 生成僵尸（门外出生点，enter 走进门内）：hpBonus/dmgBonus 由补员世代决定 */
-	private spawnZombie(hpBonus: number, dmgBonus: number): void {
+	/** 生成僵尸（门外出生点，enter 走进门内）：等级决定血量与伤害成长 */
+	private spawnZombie(level: number): void {
 		this.zombies.push({
 			id: ++this.zSeq,
 			x: ZOMBIE_SPAWN.x, y: 0, z: ZOMBIE_SPAWN.z,
 			yaw: Math.PI / 2,
-			hp: Z_MAX_HP + hpBonus, maxHp: Z_MAX_HP + hpBonus, stamina: Z_MAX_ST,
-			dmgBonus,
+			hp: Z_BASE_HP + Z_HP_PER_LEVEL * level,
+			maxHp: Z_BASE_HP + Z_HP_PER_LEVEL * level,
+			stamina: Z_MAX_ST,
+			level,
 			state: 'enter', stT: 0, windupDur: Z_WINDUP_S,
 			vulnMul: 0, stunStart: 0, deadAt: 0, target: false,
 			requestSweep: false,
@@ -1150,7 +1326,7 @@ export class World {
 					// 落手：对当前最近玩家结算
 					const v = this.nearestPlayer(z)
 					if (v && Math.hypot(v.x - z.x, v.z - z.z) <= Z_STRIKE_RANGE && Math.abs(v.y - 1.0) < 2.2) {
-						this.damagePlayerByZombie(z, v, { from: `z:${z.id}`, amount: 10 + z.dmgBonus, sign: DamageSign.Normal, impact: 10 }, now)
+						this.damagePlayerByZombie(z, v, { from: `z:${z.id}`, amount: 10 + z.level * Z_DMG_PER_LEVEL, sign: DamageSign.Normal, impact: 10 }, now)
 					}
 					if (!this.spendZ(z, Z_ATTACK_COST, now, p)) {
 						z.state = 'recover'; z.stT = 0; z.recExtra = 0
@@ -1172,14 +1348,8 @@ export class World {
 						let va = Math.abs(Math.atan2(vdx, vdz) - z.yaw)
 						while (va > Math.PI) va = Math.abs(va - Math.PI * 2)
 						if (va <= Math.PI / 2 + 0.15 && vd <= SWEEP_RANGE && v.y - 1.0 < 1.8) {
-							const wasBlocking = v.blocking
-							this.hurtPlayer(v, { from: `z:${z.id}`, amount: 12 + z.dmgBonus, sign: DamageSign.Normal, impact: 0 }, now, null)
-							if (wasBlocking) {
-								v.blocking = false
-								v.guardBreakUntil = now + GUARD_BREAK_S
-								this.useStamina(v, SWEEP_BLOCK_STAMINA, now, z)
-								this.events.push({ kind: 'guardbreak', uuid: v.uuid, dur: GUARD_BREAK_S })
-							}
+							// 横扫可被格挡：走统一僵尸伤害路径（普通格挡扣体 impact 15 / 完美格挡反噬踉跄）
+							this.damagePlayerByZombie(z, v, { from: `z:${z.id}`, amount: 12 + z.level * Z_DMG_PER_LEVEL, sign: DamageSign.Normal, impact: SWEEP_BLOCK_STAMINA }, now)
 						}
 					}
 					if (!this.spendZ(z, SWEEP_COST, now, p)) {
@@ -1217,12 +1387,12 @@ export class World {
 					if (Math.hypot(v.x - z.x, v.z - z.z) <= LUNGE_HIT_R && Math.abs(v.y - 1.0) < 2.2) {
 						z.lungeHits.add(v.uuid)
 						hit = true
-						const vd = Math.hypot(v.x - z.x, v.z - z.z) || 1
-						this.hurtPlayer(v, { from: `z:${z.id}`, amount: 14 + z.dmgBonus, sign: DamageSign.Normal, impact: 0 }, now, null)
-						this.events.push({ kind: 'knockback', uuid: v.uuid, dx: (v.x - z.x) / vd, dz: (v.z - z.z) / vd, speed: 6.5 })
-						if (v.blocking) {
-							v.blocking = false
-							v.blockCdUntil = now + BLOCK_CD_S
+						// 突进可被格挡：未格挡（掉血）才击退
+						const hpBefore = v.hp
+						this.damagePlayerByZombie(z, v, { from: `z:${z.id}`, amount: 14 + z.level * Z_DMG_PER_LEVEL, sign: DamageSign.Normal, impact: 10 }, now)
+						if (v.hp < hpBefore) {
+							const vd = Math.hypot(v.x - z.x, v.z - z.z) || 1
+							this.events.push({ kind: 'knockback', uuid: v.uuid, dx: (v.x - z.x) / vd, dz: (v.z - z.z) / vd, speed: 6.5 })
 						}
 					}
 				}
@@ -1240,8 +1410,16 @@ export class World {
 					for (const v of this.players.values()) {
 						if (v.mode !== 'fp' || v.hp <= 0) continue
 						if (Math.hypot(v.x - z.x, v.z - z.z) <= ROAR_RADIUS) {
-							this.useStamina(v, ROAR_STAMINA, now, z)
-							this.events.push({ kind: 'slow', uuid: v.uuid, dur: 1.0 })
+							if (v.blocking) {
+								// 嘶吼可被格挡：格挡中免体力损失与减速（按普通/完美走格挡冷却规则）
+								const perfect = now - v.blockStart <= v.stats.blockMaxS * v.stats.parryPct
+								this.events.push({ kind: 'parry', uuid: v.uuid, perfect, fail: false, drain: 0, byZombie: true })
+								this.registerBlock(v, now)
+								this.endBlockSuccess(v, now, perfect)
+							} else {
+								this.useStamina(v, ROAR_STAMINA, now, z)
+								this.events.push({ kind: 'slow', uuid: v.uuid, dur: 1.0 })
+							}
 						}
 					}
 					z.stamina = Math.min(Z_MAX_ST, z.stamina + ROAR_HEAL)
@@ -1326,6 +1504,11 @@ export class World {
 		const now = this.now()
 		// 三选一暂停：冻结全部模拟（僵尸 AI / 体力 / 剑气 / 清场），等待全员选择
 		if (this.pickPhase) return
+		// 升级提示期结束 → 进入升级（三选一）阶段（提示期玩家可继续攻击）
+		if (this.pickStartAt > 0 && now >= this.pickStartAt) {
+			this.pickStartAt = 0
+			this.startPickPhase()
+		}
 		// 空场清理：房间内没有第一人称玩家时清除所有僵尸
 		this.clearZombiesIfEmpty()
 		// 玩家：体力耗尽眩晕结束回满 / 武器持续行为与蓄满自动触发 / 体力回复
@@ -1375,6 +1558,12 @@ export class World {
 			t: Date.now(),
 			chase_left: this.chaseLeft,
 			pick_phase: this.pickPhase,
+			scene: {
+				exp: round2(this.exp),
+				level: this.level,
+				luck: round2(this.luck),
+				exp_mul: round2(this.expMul),
+			},
 			players: [...this.players.values()].map((p) => ({
 				uuid: p.uuid, name: p.name, color: p.color,
 				p: [round2(p.x), round2(p.y), round2(p.z)],
@@ -1400,6 +1589,7 @@ export class World {
 				p: [round2(z.x), round2(z.y), round2(z.z)],
 				yaw: round2(z.yaw),
 				hp: Math.round(z.hp), st: Math.round(z.stamina),
+				level: z.level,
 				max_hp: Math.round(z.maxHp),
 				state: z.state, st_t: round2(z.stT), windup_dur: z.windupDur,
 				vuln: z.vulnMul,
@@ -1421,6 +1611,45 @@ export class World {
 	}
 }
 
+// ---------------- 增益卡牌数据库 ----------------
+
+/**
+ * 全量卡牌池（rollCards 抽取来源）：
+ * - 17 张玩家词条卡（PICK_OPTIONS 表驱动，apply 走 applyStatChange 钩子）
+ * - 幸运 / 经验倍率 2 张场景词条卡
+ * - 8 张标签权重卡（「出现[X]卡牌的概率提高」，对应标签权重 +10）
+ */
+const CARD_DB: GameCard[] = [
+	...World.PICK_OPTIONS.map<GameCard>((o) => ({
+		id: `stat_${o.key}`,
+		label: o.label,
+		labels: ['通用'],
+		quality: CardQuality.NORMAL,
+		apply: (w, p) => w.applyStatChange(p, o.key, o.add),
+	})),
+	{
+		id: 'luck_1',
+		label: '幸运 +1',
+		labels: ['通用'],
+		quality: CardQuality.NORMAL,
+		apply: (w) => { w.luck += 1 },
+	},
+	{
+		id: 'exp_mul_13',
+		label: '经验倍率 +13%',
+		labels: ['通用'],
+		quality: CardQuality.NORMAL,
+		apply: (w) => { w.expMul = Math.round((w.expMul + 0.13) * 100) / 100 },
+	},
+	...TAG_POOL.map<GameCard>((tag) => ({
+		id: `tag_${tag}`,
+		label: `出现[${tag}]卡牌的概率提高`,
+		labels: [tag],
+		quality: CardQuality.NORMAL,
+		apply: (w) => { w.tagWeights[tag] = (w.tagWeights[tag] ?? 30) + 10 },
+	})),
+]
+
 // ---------------- 武器系统（BaseWeapon 抽象 + 双手剑 / 苍弓） ----------------
 
 /**
@@ -1431,8 +1660,12 @@ export class World {
  */
 abstract class BaseWeapon {
 	abstract weaponName: string
+	/** 普攻最小间隔（秒）：两次普攻之间的冷却 */
+	abstract attackTime: number
 	/** 普攻裁决（PF 点击上报 attack / shoot） */
 	abstract normalAttack(p: MpPlayer, segment: number, now: number): void
+	/** 格挡起手（PF 上报 parry_start；不支持格挡的武器空实现） */
+	parry(_p: MpPlayer, _now: number): void { /* 默认不可格挡 */ }
 	/** 开始重击蓄力（PF 按住上报 charge_start） */
 	abstract startCharge(p: MpPlayer, now: number): void
 	/** 提前松手（未蓄满，PF 上报 charge_stop） */
@@ -1445,15 +1678,23 @@ abstract class BaseWeapon {
 	tick?(p: MpPlayer, dt: number, now: number): void
 }
 
-/** 双手剑：现攻击逻辑解耦（三段近战 + 反击 / 追击裁决 + 蓄力剑气 + 连发队列），行为不变 */
+/** 无锋剑（原双手剑）：现攻击逻辑解耦（三段近战 + 反击 / 追击裁决 + 蓄力剑气 + 连发队列），行为不变 */
 class SwordWeapon extends BaseWeapon {
-	weaponName = '双手剑'
+	weaponName = '无锋剑'
+	attackTime = 0.3
 	constructor(private world: World) { super() }
+
+	/** 举盾格挡：眩晕 / 已格挡 / 格挡冷却 / 破防中拒绝，否则进入格挡（blocking=true 记录起手时刻） */
+	parry(p: MpPlayer, now: number): void {
+		if (p.stunUntil > now || p.blocking || now < p.blockCdUntil || now < p.guardBreakUntil) return
+		p.blocking = true
+		p.blockStart = now
+	}
 
 	normalAttack(p: MpPlayer, segment: number, now: number): void {
 		const w = this.world
 		if (p.stunUntil > now || now < p.guardBreakUntil) return
-		if (now - p.lastAttack < ATTACK_MIN_INTERVAL) return
+		if (now - p.lastAttack < this.attackTime) return
 		p.lastAttack = now
 
 		// 目标选择：僵尸优先逻辑与单机一致——按距离取最近（僵尸与玩家同池）
@@ -1523,13 +1764,16 @@ class SwordWeapon extends BaseWeapon {
 /** 苍弓：普攻射球状闪电（首中附着，0.1s/3 伤持续 6s）+ 按住重击持续激光（0.2s/15 伤），蓄满爆发 40 伤 */
 class BowWeapon extends BaseWeapon {
 	weaponName = '苍弓'
+	attackTime = 0.3
 	constructor(private world: World) { super() }
+
+	/** 苍弓不可格挡 */
 
 	/** 射球状闪电（'shoot' 上报触发）：方向 = 准星 3D 前向 */
 	normalAttack(p: MpPlayer, _segment: number, now: number): void {
 		const w = this.world
 		if (p.stunUntil > now || now < p.guardBreakUntil) return
-		if (now - p.lastAttack < ATTACK_MIN_INTERVAL) return
+		if (now - p.lastAttack < this.attackTime) return
 		p.lastAttack = now
 		w.emitOrb(p, now)
 	}

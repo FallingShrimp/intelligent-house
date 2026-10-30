@@ -23,9 +23,11 @@ export class NetZombie {
   readonly group = new THREE.Group()
   readonly id: number
   state: ZNetState = 'enter'
-  hp = 500
-  /** 血量上限：随快照 max_hp 同步（补员僵尸世代递增），HUD 血条比例分母 */
-  maxHp = 500
+  hp = 100
+  /** 血量上限：随快照 max_hp 同步（100 + 25×等级），HUD 血条比例分母 */
+  maxHp = 100
+  /** 僵尸等级（台灯召唤 = 0，死亡补员 +1）：随快照同步 */
+  level = 0
   stamina = 100
   readonly maxStamina = 100
   vulnMul = 0
@@ -135,7 +137,8 @@ export class NetZombie {
   applyState(s: NetZombieState, first = false) {
     const prev = this.state
     this.hp = s.hp
-    this.maxHp = s.max_hp || 500
+    this.maxHp = s.max_hp || 100
+    this.level = s.level ?? 0
     this.stamina = s.st
     this.vulnMul = s.vuln
     this.hasTarget = s.target

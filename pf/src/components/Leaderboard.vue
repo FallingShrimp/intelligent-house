@@ -36,9 +36,7 @@ const ranked = computed(() =>
 
 <style scoped>
 .board {
-  position: fixed;
-  top: 64px;
-  left: 16px;
+  position: static;
   z-index: 20;
   min-width: 172px;
   padding: 10px 12px 8px;

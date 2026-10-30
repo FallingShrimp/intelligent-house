@@ -26,6 +26,8 @@ import type {
 	DeviceState,
 	MpEventPayload,
 	NetPlayerState,
+	PickCardOption,
+	SceneState,
 	WorldPayload,
 	ZNetState,
 } from '../protocol/messages'
@@ -46,11 +48,11 @@ export interface CombatUiHooks {
 	onFlash(kind: 'hurt' | 'parry'): void
 }
 
-/** 击杀三选一状态（pick_phase / 我的选择变化时经 onPick 推给 App.vue） */
+/** 升级三选一状态（pick_phase / 我的选择变化时经 onPick 推给 App.vue） */
 export interface PickState {
 	active: boolean
-	/** 我抽到的 3 个增益索引（0–6；非 fp / 未进入选择时为 null） */
-	options: number[] | null
+	/** 我抽到的 3 张增益卡牌（非 fp / 未进入选择时为 null） */
+	options: PickCardOption[] | null
 	/** 我是否已选 */
 	done: boolean
 }
@@ -140,6 +142,8 @@ export class SceneManager {
 	private onDeathState?: (dead: boolean, canRespawn: boolean) => void
 	private onRoster?: (players: NetPlayerState[]) => void
 	private onPick?: (st: PickState) => void
+	private onScene?: (scene: SceneState) => void
+	private onLevelUp?: (level: number) => void
 	private meDead = false
 	private charging = false // 重击蓄力中（按住左键，移动冻结）
 	private pickSt: PickState = { active: false, options: null, done: false }
@@ -174,6 +178,8 @@ export class SceneManager {
 		onDeathState?: (dead: boolean, canRespawn: boolean) => void,
 		onRoster?: (players: NetPlayerState[]) => void,
 		onPick?: (st: PickState) => void,
+		onScene?: (scene: SceneState) => void,
+		onLevelUp?: (level: number) => void,
 	) {
 		this.onModeChange = onModeChange
 		this.onFlyChange = onFlyChange
@@ -184,6 +190,8 @@ export class SceneManager {
 		this.onDeathState = onDeathState
 		this.onRoster = onRoster
 		this.onPick = onPick
+		this.onScene = onScene
+		this.onLevelUp = onLevelUp
 
 		// ---------------- 渲染器 ----------------
 		this.renderer = new THREE.WebGLRenderer({ antialias: true })
@@ -842,6 +850,8 @@ export class SceneManager {
 
 	/** world 快照应用：远程玩家增删 / 僵尸状态机渲染 / 自己的权威数值 */
 	private applyWorld(w: WorldPayload) {
+		// 场景属性 + 共享词条（经验 / 等级 / 幸运 / 经验倍率）推送
+		this.onScene?.(w.scene)
 		// 自己的圆柱体不渲染（避免遮挡第一人称视角），数据仍经 mine 用于 HUD
 		this.remotePlayers.applySnapshot(w.players, pbClient.you?.uuid ?? null)
 		this.onRoster?.(w.players)
@@ -986,24 +996,32 @@ export class SceneManager {
 				if (e.fail) {
 					playSfx('unexactParry')
 					this.combatHooks?.onFlash('hurt')
-				} else if (e.perfect) {
-					if (e.byZombie) {
-						// 僵尸被完美格挡：60ms 内 zstun 到达 → 本次格挡耗尽僵尸体力（sword-parry）
-						if (this.pendingPerfect !== null) window.clearTimeout(this.pendingPerfect)
-						this.pendingPerfect = window.setTimeout(() => {
-							this.pendingPerfect = null
+				} else {
+					// 格挡成功（普通 / 完美）：PB 权威立即退出格挡姿态（普通格挡进入冷却）
+					this.combat.onParryJudged(e.perfect)
+					if (e.perfect) {
+						if (e.byZombie) {
+							// 僵尸被完美格挡：60ms 内 zstun 到达 → 本次格挡耗尽僵尸体力（sword-parry）
+							if (this.pendingPerfect !== null) window.clearTimeout(this.pendingPerfect)
+							this.pendingPerfect = window.setTimeout(() => {
+								this.pendingPerfect = null
+								playSfx('perfectParry')
+								this.combatHooks?.onFlash('parry')
+							}, 60)
+						} else {
 							playSfx('perfectParry')
 							this.combatHooks?.onFlash('parry')
-						}, 60)
+						}
 					} else {
-						playSfx('perfectParry')
-						this.combatHooks?.onFlash('parry')
+						playSfx('unexactParry')
 					}
-				} else {
-					playSfx('unexactParry')
 				}
 				break
 			}
+			case 'level_up':
+				// 场景升级：全员 LEVEL UP 橙色横幅（3s 动画，提示期可继续攻击）
+				this.onLevelUp?.(e.level)
+				break
 			case 'zstun':
 				if (this.pendingPerfect !== null) {
 					window.clearTimeout(this.pendingPerfect)
@@ -1107,7 +1125,7 @@ export class SceneManager {
 		// 第一人称下 Shift → 朝 WSAD 按住的方向闪避（爆发速度 + dash 音效）
 		// 注：keys.add 必须先于 Shift 分支——同帧先 Shift 后按方向键时方向需已入 keys
 		if ((e.code === 'ShiftLeft' || e.code === 'ShiftRight') && !e.repeat && this.mode === 'walk') {
-			this.tryDash(this.lastTime)
+			this.dash(this.lastTime)
 		}
 	}
 
@@ -1115,7 +1133,11 @@ export class SceneManager {
 	private lastDash = 0
 	/** 闪避速度豁免截止：期间水平软上限不生效（否则 8.5 m/s 爆发速度被钳回 3.0 等于没闪） */
 	private dashFreeUntil = 0
-	private tryDash(now: number) {
+	/**
+	 * 闪避（支持外部触发）：invincible=true 时本次闪避附带无敌帧
+	 * （上报 'dash' 意图，PB 0.3s 完全免伤；键盘 Shift 触发不带无敌，行为不变）。
+	 */
+	dash(now: number, invincible = false) {
 		if (now - this.lastDash < DASH_CD) return
 		const f = (this.keys.has('KeyW') ? 1 : 0) - (this.keys.has('KeyS') ? 1 : 0)
 		const s = (this.keys.has('KeyD') ? 1 : 0) - (this.keys.has('KeyA') ? 1 : 0)
@@ -1130,6 +1152,7 @@ export class SceneManager {
 		this.vel.z = dir.z * DASH_SPEED
 		this.lastDash = now
 		this.dashFreeUntil = now + 0.25
+		if (invincible) pbClient.sendMpAction({ kind: 'dash' })
 		playSfx('dash')
 	}
 

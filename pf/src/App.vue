@@ -4,19 +4,21 @@
  * Pinia 设备状态 → 3D 场景通过 watch 桥接（单一数据流，见 onMounted）。
  * 格斗 HUD（血条/体力/僵尸目标/飘字/格挡指示/眩晕）由 SceneManager 回调驱动。
  */
-import { onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import BuffPickModal from './components/BuffPickModal.vue'
 import DevicePanel from './components/DevicePanel.vue'
 import DeathOverlay from './components/DeathOverlay.vue'
 import DisplayNameModal from './components/DisplayNameModal.vue'
 import EmergencyBanner from './components/EmergencyBanner.vue'
 import Leaderboard from './components/Leaderboard.vue'
+import LevelUpBanner from './components/LevelUpBanner.vue'
 import MockCommandPanel from './components/MockCommandPanel.vue'
+import StatPanel from './components/StatPanel.vue'
 import StatusBar from './components/StatusBar.vue'
 import { useDevicesStore, DEVICE_ORDER } from './stores/devices'
 import { SceneManager, type PickState, type ViewMode } from './three/SceneManager'
 import type { CombatHud } from './three/combat'
-import type { DeviceId, DeviceState, NetPlayerState } from './protocol/messages'
+import type { DeviceId, DeviceState, NetPlayerState, SceneState } from './protocol/messages'
 
 import { pbClient } from './ws/client'
 
@@ -30,6 +32,20 @@ const dead = ref(false)
 const canRespawn = ref(false)
 // 玩家列表 / 杀敌榜（10Hz world 快照驱动）
 const roster = ref<NetPlayerState[]>([])
+// 我的玩家状态（词条面板展示）
+const me = computed(() => roster.value.find((p) => p.uuid === pbClient.you?.uuid) ?? null)
+// 场景属性 + 共享词条（经验 / 等级 / 幸运 / 经验倍率）
+const sceneState = ref<SceneState | null>(null)
+// LEVEL UP 橙色横幅（3s 动画：0.5s 缓出渐显 + 2s 停留 + 0.5s 缓入渐隐；提示期可继续攻击）
+const levelUp = ref<{ level: number } | null>(null)
+let levelUpTimer = 0
+// Tab 切换：击杀排行榜 + 词条面板同展示 / 关闭
+const boardVisible = ref(true)
+function toggleBoard(e: KeyboardEvent) {
+  if (e.code !== 'Tab') return
+  e.preventDefault()
+  boardVisible.value = !boardVisible.value
+}
 // 击杀三选一增益（PB pick_phase / 我的选择变化时由 SceneManager 推送）
 const pick = ref<PickState>({ active: false, options: null, done: false })
 // 联机对战：首次连接（localStorage 无 DisplayName）时弹出名字输入框
@@ -102,7 +118,14 @@ onMounted(() => {
     },
     (players) => (roster.value = players),
     (st) => (pick.value = st),
+    (scene) => (sceneState.value = scene),
+    (level) => {
+      levelUp.value = { level }
+      window.clearTimeout(levelUpTimer)
+      levelUpTimer = window.setTimeout(() => (levelUp.value = null), 3000)
+    },
   )
+  window.addEventListener('keydown', toggleBoard)
 
   // 设备状态 → 3D 场景：按 device_id 引用比较，仅对实际变化的设备调用 apply。
   // 首批（welcome/state_snapshot 全量快照）瞬时落位，其后的广播带过渡动画。
@@ -129,6 +152,8 @@ onMounted(() => {
 onBeforeUnmount(() => {
   scene?.dispose()
   scene = null
+  window.removeEventListener('keydown', toggleBoard)
+  window.clearTimeout(levelUpTimer)
 })
 </script>
 
@@ -204,7 +229,12 @@ onBeforeUnmount(() => {
       <div class="stun-text">眩晕 {{ hud.stunnedFor.toFixed(1) }}s</div>
     </div>
     <EmergencyBanner />
-    <Leaderboard :players="roster" />
+    <!-- 屏幕中心顶部：击杀排行榜 + 下方词条面板（Tab 同展示 / 关闭） -->
+    <div class="top-center-stack">
+      <Leaderboard v-if="boardVisible" :players="roster" />
+      <StatPanel v-if="boardVisible" :me="me" :scene="sceneState" />
+    </div>
+    <LevelUpBanner v-if="levelUp" :level="levelUp.level" />
     <DisplayNameModal v-if="needName" @confirm="confirmName" />
     <DeathOverlay
       v-if="dead"
@@ -241,6 +271,18 @@ onBeforeUnmount(() => {
 }
 .canvas-host :deep(canvas) {
   display: block;
+}
+.top-center-stack {
+  position: absolute;
+  top: 12px;
+  left: 50%;
+  transform: translateX(-50%);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  z-index: 20;
+  pointer-events: none;
 }
 .hint {
   position: absolute;

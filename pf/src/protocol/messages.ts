@@ -153,12 +153,12 @@ export interface MpInputPayload {
 export interface MpActionPayload {
   kind:
     | 'attack' | 'parry_start' | 'parry_stop' | 'respawn' | 'wave' | 'pick' | 'revive' | 'lamp'
-    | 'weapon' | 'shoot' | 'charge_start' | 'charge_stop'
+    | 'weapon' | 'shoot' | 'charge_start' | 'charge_stop' | 'dash'
   /** attack 专用：0-2 三段连击 / 3 空中戳刺（PB：伤害同首段，冲击力 25；普攻/反击/追击 3，重击剑气 11） */
   segment?: number
   /** wave 专用：蓄力时长 s（PB 按每秒 10 体力结算消耗） */
   hold?: number
-  /** pick 专用：所选增益索引（0–15，必须是 PB 分到自己抽中的 3 项之一） */
+  /** pick 专用：所选卡牌索引（0-2，必须是 PB 分到自己抽中的 3 张之一） */
   idx?: number
   /** revive 专用：要复活的队友（尸体）uuid */
   target?: string
@@ -166,8 +166,32 @@ export interface MpActionPayload {
   weapon?: WeaponId
 }
 
-/** 武器 ID（与 PB WeaponId 同构）：双手剑 / 苍弓 */
+/** 武器 ID（与 PB WeaponId 同构）：无锋剑 / 苍弓 */
 export type WeaponId = 'sword' | 'bow'
+
+/** 卡牌稀有度（与 PB CardQuality 枚举同构）：决定抽取权重与展示样式 */
+export type CardQuality = 'WASTE' | 'NORMAL' | 'RARE' | 'EPIC' | 'LEGENDARY' | 'INFINITY';
+
+/** 升级三选一卡牌选项（PB PickCardView 投影，不含 apply 函数） */
+export interface PickCardOption {
+  id: string;
+  label: string;
+  quality: CardQuality;
+  /** 标签列表（决定抽取路径，PF 展示 chips） */
+  labels: string[];
+}
+
+/** 场景属性与共享词条（PB 权威，全员一致） */
+export interface SceneState {
+  /** 场景经验（当前值） */
+  exp: number;
+  /** 场景等级 */
+  level: number;
+  /** 幸运（共享词条：稀有度抽取加权 = max(1, 初始 + 幸运 × 加权)） */
+  luck: number;
+  /** 经验倍率（共享词条，×100 展示） */
+  exp_mul: number;
+}
 
 export type ZNetState =
   | 'enter' | 'chase' | 'windup' | 'recover' | 'stunned' | 'dead'
@@ -198,16 +222,18 @@ export interface NetPlayerState {
   def: number;
   /** 当前武器（Q/E 切换，PB 权威回写） */
   weapon: WeaponId;
-  /** 三选一状态（进行中非空）：抽到的 3 个增益索引 + 是否已选 */
-  pick: { options: number[]; done: boolean } | null;
+  /** 三选一（升级）状态（进行中非空）：抽到的 3 张增益卡牌 + 是否已选 */
+  pick: { options: PickCardOption[]; done: boolean } | null;
 }
 
 export interface NetZombieState {
   id: number;
   p: [number, number, number]; yaw: number;
   hp: number; st: number;
-  /** 血量上限（补员僵尸世代递增：500 + 40×世代），血条比例分母 */
+  /** 血量上限（100 + 25×等级），血条比例分母 */
   max_hp: number;
+  /** 僵尸等级（台灯召唤 = 0，死亡补员 +1）：伤害 / 血量成长系数 */
+  level: number;
   state: ZNetState; st_t: number; windup_dur: number;
   vuln: number;
   target: boolean;
@@ -219,6 +245,8 @@ export interface WorldPayload {
   chase_left: number;
   /** 击杀三选一进行中（全员选完前 PB 冻结 tick） */
   pick_phase: boolean;
+  /** 场景属性 + 共享词条（经验 / 等级 / 幸运 / 经验倍率） */
+  scene: SceneState;
   players: NetPlayerState[];
   zombies: NetZombieState[];
 }
@@ -235,6 +263,8 @@ export type MpEventPayload =
   | { kind: 'parry'; uuid: string; perfect: boolean; fail: boolean; drain: number; byZombie: boolean }
   | { kind: 'zstun'; id: number; mul: number }
   | { kind: 'zdie'; id: number }
+  /** 场景升级（经验达阈值）：全员 LEVEL UP 提示，提示期（3s）结束进入升级三选一 */
+  | { kind: 'level_up'; level: number }
   | { kind: 'knockback'; uuid: string; dx: number; dz: number; speed: number }
   | { kind: 'slow'; uuid: string; dur: number }
   | { kind: 'guardbreak'; uuid: string; dur: number }
