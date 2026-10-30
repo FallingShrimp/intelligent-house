@@ -895,20 +895,26 @@ export class World {
 
 	/** 抽 3 张增益卡牌：①权重抽标签 → ②幸运加权抽稀有度 → ③筛含该标签的卡随机（不加权） */
 	private rollCards(): GameCard[] {
-		// 抽 3 个互不重复的 (标签, 稀有度) 条件对：任一重复则整体重抽（避免重复条件浪费抽取次数）
-		let conds: { tag: string; quality: CardQuality }[]
-		do {
-			conds = Array.from({ length: 3 }, () => ({ tag: this.weightedTag(), quality: this.rollQuality() }))
-		} while (new Set(conds.map((c) => `${c.tag}|${c.quality}`)).size < 3)
-		const cards: GameCard[] = []
-		for (const { tag, quality } of conds) {
-			// 筛选：卡牌标签列表含指定标签即算符合；稀有度无卡时回退该标签任意稀有度，再回退全卡池
-			const exact = CARD_DB.filter((c) => c.quality === quality && c.labels.includes(tag))
-			const byTag = exact.length ? exact : CARD_DB.filter((c) => c.labels.includes(tag))
-			const pool = byTag.length ? byTag : CARD_DB
-			cards.push(pool[Math.floor(Math.random() * pool.length)])
+		while (true) {
+			// 抽 3 个互不重复的 (标签, 稀有度) 条件对：任一重复则整体重抽（避免重复条件浪费抽取次数）
+			let conds: { tag: string; quality: CardQuality }[]
+			do {
+				conds = Array.from({ length: 3 }, () => ({ tag: this.weightedTag(), quality: this.rollQuality() }))
+			} while (new Set(conds.map((c) => `${c.tag}|${c.quality}`)).size < 3)
+			// 按条件对筛卡（多标签卡可被不同条件对同时命中）：出现重复卡牌 → conds 不变重抽，最多重试 3 次
+			for (let retry = 0; retry <= 3; retry++) {
+				const cards: GameCard[] = []
+				for (const { tag, quality } of conds) {
+					// 筛选：卡牌标签列表含指定标签即算符合；稀有度无卡时回退该标签任意稀有度，再回退全卡池
+					const exact = CARD_DB.filter((c) => c.quality === quality && c.labels.includes(tag))
+					const byTag = exact.length ? exact : CARD_DB.filter((c) => c.labels.includes(tag))
+					const pool = byTag.length ? byTag : CARD_DB
+					cards.push(pool[Math.floor(Math.random() * pool.length)])
+				}
+				if (new Set(cards).size === 3) return cards
+			}
+			// 3 次重试仍重复（概率极低）→ 条件对本身不合适（如多个条件对回退到同一小池），整体重抽 conds
 		}
-		return cards
 	}
 
 	/** 按标签权重抽 1 个标签（权重越大越容易被抽到） */
