@@ -66,7 +66,7 @@ const ZOMBIE_TTL_DEAD = 2.0
 const ZOMBIE_SPAWN = { x: -4.55, z: 1.9 }
 
 /** 增益卡牌标签池（初始抽取权重均 30；「出现[X]卡牌的概率提高」卡牌使对应标签权重 +10） */
-const TAG_POOL = ['通用', '生存', '暴击', '专精-无锋剑', '专精-苍弓', '专精-圣金源盾', '专精-星尘溶液', '专精-AK47']
+const TAG_POOL = ['通用', '生命', '防御', '暴击', '专精-无锋剑', '专精-苍弓', '专精-圣金源盾', '专精-星尘溶液', '专精-AK47']
 
 // 重击剑气（远程弹道）
 const WAVE_SPEED = 12     // m/s
@@ -193,6 +193,8 @@ interface PickOption {
 	label: string
 	key: StatKey
 	add: number
+	/** 卡牌标签列表（rollCards 第③步筛卡依据） */
+	labels: string[]
 }
 
 /** 伤害符号：治疗 / 被闪避·格挡 / 正常 / 暴击 */
@@ -410,8 +412,8 @@ export class World {
 	exp = 0
 	/** 场景等级（INT，初始 0） */
 	level = 0
-	/** 标签抽取权重（标签池初始均 30，「出现[X]卡牌的概率提高」卡牌 +10） */
-	tagWeights: Record<string, number> = Object.fromEntries(TAG_POOL.map((t) => [t, 30]))
+	/** 标签抽取权重：标签池初始均 30（「出现[X]卡牌的概率提高」卡牌 +10）；「强化」固定 30 不在池内（无对应概率卡，不会被改动） */
+	tagWeights: Record<string, number> = { ...Object.fromEntries(TAG_POOL.map((t) => [t, 30])), 强化: 30 }
 	/** 升级提示期截止（level_up 后 3s 进入升级选择；提示期玩家可继续攻击） */
 	private pickStartAt = 0
 	/** 武器裁决实例（同模块 BaseWeapon 实现：双手剑 / 苍弓，可访问下方公开的裁决方法） */
@@ -861,23 +863,23 @@ export class World {
 
 	/** 增益选项定义（表驱动，索引即协议值；label 与 PF BuffPickModal.LABELS 对齐） */
 	static readonly PICK_OPTIONS: PickOption[] = [
-		{ label: '攻击力 +5', key: 'atk', add: 5 },
-		{ label: '血量上限 +20', key: 'maxHp', add: 20 },
-		{ label: '完美格挡窗口 +2%', key: 'parryPct', add: 0.02 },
-		{ label: '体力上限 +10', key: 'maxSt', add: 10 },
-		{ label: '格挡最大持续 +0.25s', key: 'blockMaxS', add: 0.25 },
-		{ label: '所有伤害 +10%', key: 'dmgMul', add: 0.1 },
-		{ label: '重击蓄力速度 +15%', key: 'chargeSpd', add: 0.15 },
-		{ label: '荆棘 +15%', key: 'thorn', add: 0.15 },
-		{ label: '吸血 +2', key: 'lifesteal', add: 2 },
-		{ label: '连续剑气 +1', key: 'multiWave', add: 1 },
-		{ label: '蓄力上限 +0.25s', key: 'chargeMax', add: 0.25 },
-		{ label: '冲击力 +15%', key: 'impact', add: 0.15 },
-		{ label: '稳定性 +15%', key: 'stability', add: 0.15 },
-		{ label: '暴击率 +5%', key: 'critRate', add: 0.05 },
-		{ label: '暴击伤害 +25%', key: 'critDmg', add: 0.25 },
-		{ label: '化气 +10%', key: 'huaqi', add: 0.1 },
-		{ label: '防御 +30', key: 'def', add: 30 },
+		{ label: '攻击力 +5', key: 'atk', add: 5, labels: ['通用'] },
+		{ label: '血量上限 +20', key: 'maxHp', add: 20, labels: ['生命'] },
+		{ label: '完美格挡窗口 +2%', key: 'parryPct', add: 0.02, labels: ['防御'] },
+		{ label: '体力上限 +10', key: 'maxSt', add: 10, labels: ['防御', '通用'] },
+		{ label: '格挡最大持续 +0.25s', key: 'blockMaxS', add: 0.25, labels: ['防御'] },
+		{ label: '所有伤害 +10%', key: 'dmgMul', add: 0.1, labels: ['通用'] },
+		{ label: '重击蓄力速度 +15%', key: 'chargeSpd', add: 0.15, labels: ['专精-无锋剑'] },
+		{ label: '荆棘 +15%', key: 'thorn', add: 0.15, labels: ['生命', '防御'] },
+		{ label: '吸血 +2', key: 'lifesteal', add: 2, labels: ['生命'] },
+		{ label: '连续剑气 +1', key: 'multiWave', add: 1, labels: ['专精-无锋剑'] },
+		{ label: '蓄力上限 +0.25s', key: 'chargeMax', add: 0.25, labels: ['通用'] },
+		{ label: '冲击力 +15%', key: 'impact', add: 0.15, labels: ['防御', '通用'] },
+		{ label: '稳定性 +15%', key: 'stability', add: 0.15, labels: ['防御'] },
+		{ label: '暴击率 +5%', key: 'critRate', add: 0.05, labels: ['暴击'] },
+		{ label: '暴击伤害 +25%', key: 'critDmg', add: 0.25, labels: ['暴击'] },
+		{ label: '化气 +10%', key: 'huaqi', add: 0.1, labels: ['防御', '生命'] },
+		{ label: '防御 +30', key: 'def', add: 30, labels: ['防御'] },
 	]
 
 	/** 僵尸被击败：房间内所有第一人称玩家进入升级（三选一，每人独立抽 3 张卡牌） */
@@ -1615,36 +1617,37 @@ export class World {
 
 /**
  * 全量卡牌池（rollCards 抽取来源）：
- * - 17 张玩家词条卡（PICK_OPTIONS 表驱动，apply 走 applyStatChange 钩子）
- * - 幸运 / 经验倍率 2 张场景词条卡
- * - 8 张标签权重卡（「出现[X]卡牌的概率提高」，对应标签权重 +10）
+ * - 17 张玩家词条卡（PICK_OPTIONS 表驱动，apply 走 applyStatChange 钩子，标签见各选项 labels）
+ * - 幸运 / 经验倍率 2 张场景词条卡（标签「强化」）
+ * - 9 张标签权重卡（「出现[X]卡牌的概率提高」，对应标签权重 +10，标签「强化」）
+ * 「强化」标签权重固定 30 且无对应概率卡（场景词条 / 标签权重卡专属标签）。
  */
 const CARD_DB: GameCard[] = [
 	...World.PICK_OPTIONS.map<GameCard>((o) => ({
 		id: `stat_${o.key}`,
 		label: o.label,
-		labels: ['通用'],
+		labels: o.labels,
 		quality: CardQuality.NORMAL,
 		apply: (w, p) => w.applyStatChange(p, o.key, o.add),
 	})),
 	{
 		id: 'luck_1',
 		label: '幸运 +1',
-		labels: ['通用'],
+		labels: ['强化'],
 		quality: CardQuality.NORMAL,
 		apply: (w) => { w.luck += 1 },
 	},
 	{
 		id: 'exp_mul_13',
 		label: '经验倍率 +13%',
-		labels: ['通用'],
+		labels: ['强化'],
 		quality: CardQuality.NORMAL,
 		apply: (w) => { w.expMul = Math.round((w.expMul + 0.13) * 100) / 100 },
 	},
 	...TAG_POOL.map<GameCard>((tag) => ({
 		id: `tag_${tag}`,
 		label: `出现[${tag}]卡牌的概率提高`,
-		labels: [tag],
+		labels: ['强化'],
 		quality: CardQuality.NORMAL,
 		apply: (w) => { w.tagWeights[tag] = (w.tagWeights[tag] ?? 30) + 10 },
 	})),
