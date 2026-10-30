@@ -412,8 +412,8 @@ export class World {
 	exp = 0
 	/** 场景等级（INT，初始 0） */
 	level = 0
-	/** 标签抽取权重：标签池初始均 30（「出现[X]卡牌的概率提高」卡牌 +10）；「强化」固定 30 不在池内（无对应概率卡，不会被改动） */
-	tagWeights: Record<string, number> = { ...Object.fromEntries(TAG_POOL.map((t) => [t, 30])), 强化: 30 }
+	/** 标签抽取权重：标签池初始均 30（「出现[X]卡牌的概率提高」卡牌 +10）；「强化」固定 15 不在池内（无对应概率卡，不会被改动） */
+	tagWeights: Record<string, number> = { ...Object.fromEntries(TAG_POOL.map((t) => [t, 30])), 强化: 15 }
 	/** 升级提示期截止（level_up 后 3s 进入升级选择；提示期玩家可继续攻击） */
 	private pickStartAt = 0
 	/** 武器裁决实例（同模块 BaseWeapon 实现：双手剑 / 苍弓，可访问下方公开的裁决方法） */
@@ -1620,7 +1620,7 @@ export class World {
  * - 17 张玩家词条卡（PICK_OPTIONS 表驱动，apply 走 applyStatChange 钩子，标签见各选项 labels）
  * - 幸运 / 经验倍率 2 张场景词条卡（标签「强化」）
  * - 9 张标签权重卡（「出现[X]卡牌的概率提高」，对应标签权重 +10，标签「强化」）
- * 「强化」标签权重固定 30 且无对应概率卡（场景词条 / 标签权重卡专属标签）。
+ * 「强化」标签权重固定 15 且无对应概率卡（场景词条 / 标签权重卡专属标签）。
  */
 const CARD_DB: GameCard[] = [
 	...World.PICK_OPTIONS.map<GameCard>((o) => ({
