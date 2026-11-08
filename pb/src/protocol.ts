@@ -162,8 +162,6 @@ export const HelloPayloadSchema = z
 		role: z.enum(['scb', 'pf']),
 		client_name: z.string(),
 		client_version: z.string(),
-		// 联机对战：PF 必须提供玩家名（PB 据此注册玩家并分配 uuid/颜色）
-		display_name: z.string().min(1).max(24).optional(),
 	})
 	.strict()
 export type HelloPayload = z.infer<typeof HelloPayloadSchema>
@@ -218,41 +216,6 @@ export const UiCommandPayloadSchema = z
 	.strict()
 export type UiCommandPayload = z.infer<typeof UiCommandPayloadSchema>
 
-// ---------- 联机对战（PB 权威世界模拟，PF 只上报输入 / 动作意图） ----------
-
-/** PF 输入状态（建议 10Hz）：位置 / 朝向 / 视线（3D，剑气方向用）/ 视角模式 / 当前动作标签 */
-export const MpInputPayloadSchema = z
-	.object({
-		p: z.tuple([z.number(), z.number(), z.number()]),
-		yaw: z.number(),
-		dir: z.tuple([z.number(), z.number()]), // 相机水平前向单位向量
-		dir3: z.tuple([z.number(), z.number(), z.number()]), // 相机 3D 前向（准星方向，剑气飞行用）
-		mode: z.enum(['fp', 'free']),
-		anim: z.string().nullish(),
-	})
-	.strict()
-export type MpInputPayload = z.infer<typeof MpInputPayloadSchema>
-
-/** PF 动作意图：攻击 / 格挡 / 请求复活 / 剑气 / 三选一 / 队友复活 / 台灯召唤 / 武器切换 */
-export const MpActionPayloadSchema = z
-	.object({
-		kind: z.enum([
-			'attack', 'parry_start', 'parry_stop', 'respawn', 'wave', 'pick', 'revive', 'lamp',
-			'weapon', 'shoot', 'charge_start', 'charge_stop',
-		]),
-		segment: z.number().int().min(0).max(3).optional(),
-		/** wave 专用：蓄力时长 s（PB 按每秒 10 体力结算消耗） */
-		hold: z.number().min(0).max(10).optional(),
-		/** pick 专用：选择的增益索引（0-15，必须是 PF 分到的 3 项之一） */
-		idx: z.number().int().min(0).max(16).optional(),
-		/** revive 专用：要复活的玩家 uuid */
-		target: z.string().min(1).optional(),
-		/** weapon 专用：切换到的武器 */
-		weapon: z.enum(['sword', 'bow']).optional(),
-	})
-	.strict()
-export type MpActionPayload = z.infer<typeof MpActionPayloadSchema>
-
 /** PF 专属：重启 PB 服务（仅 PF 通道可发，SCB 天然隔离） */
 export const AdminRestartPayloadSchema = z.object({}).strict()
 export type AdminRestartPayload = z.infer<typeof AdminRestartPayloadSchema>
@@ -287,8 +250,6 @@ export const PF_PAYLOAD_SCHEMAS: Record<string, z.ZodTypeAny> = {
 	hello: HelloPayloadSchema,
 	state_request: StateRequestPayloadSchema,
 	ui_command: UiCommandPayloadSchema,
-	mp_input: MpInputPayloadSchema,
-	mp_action: MpActionPayloadSchema,
 	admin_restart: AdminRestartPayloadSchema,
 }
 

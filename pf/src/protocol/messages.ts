@@ -118,168 +118,13 @@ export interface HelloPayload {
   role: Role;
   client_name: string;
   client_version: string;
-  /** 联机对战：PF 必须携带玩家名（localStorage DisplayName） */
-  display_name?: string;
-}
-
-export interface PlayerYou {
-  uuid: string;
-  name: string;
-  color: string;
 }
 
 export interface WelcomePayload {
   client_id: string;
   server_ts: number;
   snapshot: StateSnapshotPayload;
-  /** 联机对战：本客户端的玩家身份 */
-  you?: PlayerYou;
 }
-
-// ---------- 联机对战（PB 权威世界模拟） ----------
-
-/** PF → PB 输入状态（10Hz） */
-export interface MpInputPayload {
-  p: [number, number, number];
-  yaw: number;
-  dir: [number, number];
-  /** 相机 3D 前向（准星方向，剑气飞行方向用） */
-  dir3: [number, number, number];
-  mode: 'fp' | 'free';
-  anim?: string | null;
-}
-
-/** PF → PB 动作意图 */
-export interface MpActionPayload {
-  kind:
-    | 'attack' | 'parry_start' | 'parry_stop' | 'respawn' | 'wave' | 'pick' | 'revive' | 'lamp'
-    | 'weapon' | 'shoot' | 'charge_start' | 'charge_stop' | 'dash'
-  /** attack 专用：0-2 三段连击 / 3 空中戳刺（PB：伤害同首段，冲击力 25；普攻/反击/追击 3，重击剑气 11） */
-  segment?: number
-  /** wave 专用：蓄力时长 s（PB 按每秒 10 体力结算消耗） */
-  hold?: number
-  /** pick 专用：所选卡牌索引（0-2，必须是 PB 分到自己抽中的 3 张之一） */
-  idx?: number
-  /** revive 专用：要复活的队友（尸体）uuid */
-  target?: string
-  /** weapon 专用：切换到的武器 */
-  weapon?: WeaponId
-}
-
-/** 武器 ID（与 PB WeaponId 同构）：无锋剑 / 苍弓 */
-export type WeaponId = 'sword' | 'bow'
-
-/** 卡牌稀有度（与 PB CardQuality 枚举同构）：决定抽取权重与展示样式 */
-export type CardQuality = 'WASTE' | 'NORMAL' | 'RARE' | 'EPIC' | 'LEGENDARY' | 'INFINITY';
-
-/** 升级三选一卡牌选项（PB PickCardView 投影，不含 apply 函数） */
-export interface PickCardOption {
-  id: string;
-  label: string;
-  quality: CardQuality;
-  /** 标签列表（决定抽取路径，PF 展示 chips） */
-  labels: string[];
-}
-
-/** 场景属性与共享词条（PB 权威，全员一致） */
-export interface SceneState {
-  /** 场景经验（当前值） */
-  exp: number;
-  /** 场景等级 */
-  level: number;
-  /** 幸运（共享词条：稀有度抽取加权 = max(1, 初始 + 幸运 × 加权)） */
-  luck: number;
-  /** 经验倍率（共享词条，×100 展示） */
-  exp_mul: number;
-}
-
-export type ZNetState =
-  | 'enter' | 'chase' | 'windup' | 'recover' | 'stunned' | 'dead'
-  | 'sweep' | 'lungeWind' | 'lungeDash' | 'roar';
-
-export interface NetPlayerState {
-  uuid: string; name: string; color: string;
-  p: [number, number, number]; yaw: number;
-  fp: boolean;
-  hp: number; st: number;
-  /** 击杀三选一累积增益（血条比例 / 伤害数字等展示用） */
-  max_hp: number; max_st: number; atk: number; dmg_mul: number;
-  stun_for: number;
-  blocking: boolean;
-  anim: string | null;
-  kills: number;
-  /** 格挡最大持续 s / 完美格挡窗口比例（窗口 = max_block × parry_pct）/ 重击蓄力时长 s */
-  max_block: number; parry_pct: number; charge_dur: number;
-  /** 荆棘（受击反伤比例）/ 吸血（造成伤害回复固定值）/ 连续剑气（蓄力后追加发数） */
-  thorn_pct: number; lifesteal: number; multi_wave: number;
-  /** 冲击力（攻击扣对方体力的倍率）/ 稳定性（受击扣自身体力的抗性） */
-  impact: number; stability: number;
-  /** 暴击率（0~1）/ 暴击伤害加成（暴击伤害 = 基础 × (1 + crit_dmg)） */
-  crit_rate: number; crit_dmg: number;
-  /** 化气（完美格挡回复比例：回复血量 = 格挡伤害 × huaqi） */
-  huaqi: number;
-  /** 防御（受伤减免：最终伤害 = 原始 × 500 / (490 + def)，初始 10 → ×1 基准） */
-  def: number;
-  /** 当前武器（Q/E 切换，PB 权威回写） */
-  weapon: WeaponId;
-  /** 三选一（升级）状态（进行中非空）：抽到的 3 张增益卡牌 + 是否已选 */
-  pick: { options: PickCardOption[]; done: boolean } | null;
-}
-
-export interface NetZombieState {
-  id: number;
-  p: [number, number, number]; yaw: number;
-  hp: number; st: number;
-  /** 血量上限（100 + 25×等级），血条比例分母 */
-  max_hp: number;
-  /** 僵尸等级（台灯召唤 = 0，死亡补员 +1）：伤害 / 血量成长系数 */
-  level: number;
-  state: ZNetState; st_t: number; windup_dur: number;
-  vuln: number;
-  target: boolean;
-}
-
-/** PB → PF 世界快照（10Hz） */
-export interface WorldPayload {
-  t: number;
-  chase_left: number;
-  /** 击杀三选一进行中（全员选完前 PB 冻结 tick） */
-  pick_phase: boolean;
-  /** 场景属性 + 共享词条（经验 / 等级 / 幸运 / 经验倍率） */
-  scene: SceneState;
-  players: NetPlayerState[];
-  zombies: NetZombieState[];
-}
-
-/** 伤害符号（与 PB DamageSign 枚举同构）：治疗 / 被闪避·格挡 / 正常 / 暴击 */
-export type DamageSign = -1 | 0 | 1 | 2;
-
-/** PB → PF 战斗事件（伤害 / 格挡 / 眩晕 / 击退等，瞬时效果触发） */
-export type MpEventPayload =
-  | { kind: 'join'; uuid: string; name: string; color: string }
-  | { kind: 'leave'; uuid: string; name: string }
-  | { kind: 'dmg_z'; id: number; amount: number; sign: DamageSign; by: string }
-  | { kind: 'dmg_p'; uuid: string; amount: number; sign: DamageSign; by: string; interrupt: boolean }
-  | { kind: 'parry'; uuid: string; perfect: boolean; fail: boolean; drain: number; byZombie: boolean }
-  | { kind: 'zstun'; id: number; mul: number }
-  | { kind: 'zdie'; id: number }
-  /** 场景升级（经验达阈值）：全员 LEVEL UP 提示，提示期（3s）结束进入升级三选一 */
-  | { kind: 'level_up'; level: number }
-  | { kind: 'knockback'; uuid: string; dx: number; dz: number; speed: number }
-  | { kind: 'slow'; uuid: string; dur: number }
-  | { kind: 'guardbreak'; uuid: string; dur: number }
-  /** 复活：pos 为复活落点（手动 = 出生点 / 队友复活 = 原地），PF 相机复位用 */
-  | { kind: 'respawn'; uuid: string; pos: [number, number, number] }
-  | { kind: 'counter_open' }
-  | { kind: 'roar_interrupt'; id: number }
-  /** 重击剑气：by 玩家从 (x,y,z) 沿 3D (dx,dy,dz) 发射，绕飞行轴随机 roll 旋转（各 PF 本地渲染飞行视觉 + 与 PB 同公式定向，伤害由 PB 弹道裁决） */
-  | { kind: 'wave'; by: string; x: number; y: number; z: number; dx: number; dy: number; dz: number; roll: number }
-  /** 苍弓射球：by 玩家从 (x,y,z) 沿 3D (dx,dy,dz) 发射球状闪电（PF 本地渲染飞行视觉，伤害由 PB 裁决） */
-  | { kind: 'orb'; by: string; id: number; x: number; y: number; z: number; dx: number; dy: number; dz: number }
-  /** 球状闪电停止前进：target = 附着目标 key（PF 跟随目标渲染）；null = 球消失（PF 移除视觉） */
-  | { kind: 'orb_stop'; id: number; x: number; y: number; z: number; target: string | null }
-  /** 苍弓蓄满爆发：一道 40 伤激光沿 (dx,dy,dz)（PF 播爆发特效 + 微震，伤害由 PB 射线裁决） */
-  | { kind: 'beam_burst'; by: string; x: number; y: number; z: number; dx: number; dy: number; dz: number };
 
 export interface HeartbeatPayload {
   acq_connected: boolean;
@@ -397,18 +242,14 @@ export interface DecodeStatusMsg extends BaseMessage { type: 'decode_status'; pa
 
 export interface StateRequestMsg extends BaseMessage { type: 'state_request'; payload: StateRequestPayload; }
 export interface UiCommandMsg extends BaseMessage { type: 'ui_command'; payload: UiCommandPayload; }
-export interface MpInputMsg extends BaseMessage { type: 'mp_input'; payload: MpInputPayload; }
-export interface MpActionMsg extends BaseMessage { type: 'mp_action'; payload: MpActionPayload; }
 export interface AdminRestartMsg extends BaseMessage { type: 'admin_restart'; payload: Record<string, never>; }
 
 // ---- PB → SCB ----
 
 export interface ConfigUpdateMsg extends BaseMessage { type: 'config_update'; payload: ConfigUpdatePayload; }
 
-// ---- PB → PF（联机对战） ----
+// ---- PB → PF ----
 
-export interface WorldMsg extends BaseMessage { type: 'world'; payload: WorldPayload; }
-export interface EventMsg extends BaseMessage { type: 'event'; payload: MpEventPayload; }
 export interface AdminRestartingMsg extends BaseMessage { type: 'admin_restarting'; payload: AdminRestartingPayload; }
 
 // ---------- 5. 通道消息集合 ----------
@@ -418,9 +259,9 @@ export type FromScb = HelloMsg | HeartbeatMsg | DeviceCommandMsg | DecodeStatusM
 /** PB 视角：发送给 SCB */
 export type ToScb = WelcomeMsg | CommandAckMsg | DeviceStateUpdateMsg | StateSnapshotMsg | ConfigUpdateMsg | ErrorMsg;
 /** PB 视角：从 PF 接收 */
-export type FromPf = HelloMsg | StateRequestMsg | UiCommandMsg | MpInputMsg | MpActionMsg | AdminRestartMsg;
+export type FromPf = HelloMsg | StateRequestMsg | UiCommandMsg | AdminRestartMsg;
 /** PB 视角：发送给 PF */
-export type ToPf = WelcomeMsg | StateSnapshotMsg | DeviceStateUpdateMsg | CommandAckMsg | ErrorMsg | WorldMsg | EventMsg | AdminRestartingMsg;
+export type ToPf = WelcomeMsg | StateSnapshotMsg | DeviceStateUpdateMsg | CommandAckMsg | ErrorMsg | AdminRestartingMsg;
 
 /** 按类型收窄消息（PF 侧常用） */
 export function isType<T extends ToPf['type']>(msg: ToPf, type: T): msg is Extract<ToPf, { type: T }> {

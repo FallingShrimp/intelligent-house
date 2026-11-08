@@ -21,7 +21,6 @@ import {
 	type StateSnapshotMsg,
 	type ToPf,
 	type WelcomeMsg,
-	type WorldMsg,
 } from '../protocol/messages'
 
 // ---------------- 构造样例消息 ----------------
@@ -111,13 +110,6 @@ export function checkSwitchNarrowing(msg: ToPf): number {
 		case 'error': {
 			const e: ErrorMsg = msg
 			return e.payload.ref_seq ?? -1
-		}
-		case 'world': {
-			const w: WorldMsg = msg
-			return w.payload.players.length
-		}
-		case 'event': {
-			return 0
 		}
 		case 'admin_restarting': {
 			return 0

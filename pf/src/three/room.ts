@@ -24,7 +24,7 @@ export interface RoomRig {
   ambient: THREE.AmbientLight
   /** 茶几玻璃杯中的水体（「喝水」交互：缩放 y 即水位变化，见 SceneManager） */
   water: THREE.Mesh
-  /** 室内角落的台灯（联机对战：点击召唤僵尸，见 SceneManager.interact） */
+  /** 室内角落的台灯（装饰物件） */
   lamp: THREE.Group
   dispose(): void
 }
@@ -283,7 +283,7 @@ export function buildRoom(scene: THREE.Scene): RoomRig {
   leaves.castShadow = true
   group.add(pot, leaves)
 
-  // ---------------- 台灯（东北角边几上，联机对战点击召唤僵尸） ----------------
+  // ---------------- 台灯（东北角边几上，装饰物件） ----------------
   const lamp = new THREE.Group()
   // 小圆边几（单柱 + 底盘）
   const standTop = new THREE.Mesh(track(new THREE.CylinderGeometry(0.22, 0.22, 0.04, 20)), woodMat)
@@ -313,7 +313,6 @@ export function buildRoom(scene: THREE.Scene): RoomRig {
   lampGlow.position.y = 0.88
   lamp.add(lampBase, lampStem, shade, lampGlow)
   // 整组可交互（射线命中子网格后沿父链取 userData.interact）
-  lamp.userData.interact = 'lamp'
   lamp.position.set(3.12, 0, -2.42)
   group.add(lamp)
 

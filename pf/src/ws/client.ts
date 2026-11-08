@@ -13,14 +13,9 @@ import {
 	type AdminRestartingPayload,
 	type CommandParams,
 	type DeviceId,
-	type MpActionPayload,
-	type MpEventPayload,
-	type MpInputPayload,
-	type PlayerYou,
 	type StateRequestPayload,
 	type ToPf,
 	type UiCommandPayload,
-	type WorldPayload,
 } from '../protocol/messages'
 import { useConnectionStore } from '../stores/connection'
 import { useDevicesStore } from '../stores/devices'
@@ -59,26 +54,11 @@ export class PbClient {
 	/** 是否发生过断线（用于判断重连后是否补发 state_request） */
 	private hasDisconnected = false
 
-	/** 联机对战：本客户端玩家名（hello 必带；连接前由 setDisplayName 写入） */
-	private displayName = ''
-	/** 联机对战：PB 分配的本玩家身份（welcome 后可读） */
-	you: PlayerYou | null = null
-	/** 联机对战：世界快照 / 战斗事件回调（SceneManager 注册） */
-	onWorld?: (payload: WorldPayload) => void
-	onMpEvent?: (payload: MpEventPayload) => void
 	/** 运维：PB 即将重启（自接管） */
 	onAdminRestarting?: (payload: AdminRestartingPayload) => void
 
 	constructor(url: string = resolvePbUrl()) {
 		this.url = url
-	}
-
-	setDisplayName(name: string) {
-		this.displayName = name
-	}
-
-	get hasIdentity(): boolean {
-		return this.displayName.length > 0
 	}
 
 	/** 建立连接（可在 pinia 安装后调用） */
@@ -104,16 +84,6 @@ export class PbClient {
 		const payload: UiCommandPayload = { device_id: deviceId, action }
 		if (params) payload.params = params
 		this.send('ui_command', payload)
-	}
-
-	/** 联机对战：上报输入状态（10Hz，SceneManager 调用） */
-	sendMpInput(payload: MpInputPayload) {
-		this.send('mp_input', payload)
-	}
-
-	/** 联机对战：上报动作意图（攻击 / 格挡开始 / 结束） */
-	sendMpAction(payload: MpActionPayload) {
-		this.send('mp_action', payload)
 	}
 
 	/** 运维：请求重启 PB 服务（自接管重启） */
@@ -148,9 +118,9 @@ export class PbClient {
 		return this.seqCounter++
 	}
 
-	/** PF → PB 可发送的消息类型（docs 7.5 + 联机对战 mp_input/mp_action + 运维 admin_restart） */
+	/** PF → PB 可发送的消息类型（docs 7.5 + 运维 admin_restart） */
 	private send(
-		type: 'hello' | 'state_request' | 'ui_command' | 'mp_input' | 'mp_action' | 'admin_restart',
+		type: 'hello' | 'state_request' | 'ui_command' | 'admin_restart',
 		payload: unknown,
 	) {
 		const ws = this.ws
@@ -168,12 +138,11 @@ export class PbClient {
 		this.attempt = 0
 		conn.setStatus('connected')
 
-		// 接入注册（docs 7.5：PF → hello，role=pf 二次校验；联机对战必带玩家名）
+		// 接入注册（docs 7.5：PF → hello，role=pf 二次校验）
 		this.send('hello', {
 			role: 'pf',
 			client_name: CLIENT_NAME,
 			client_version: CLIENT_VERSION,
-			display_name: this.displayName || undefined,
 		})
 
 		// welcome 已携带全量快照；断线期间可能错过状态广播，重连成功后主动拉取一次
@@ -202,7 +171,6 @@ export class PbClient {
 
 		if (isType(msg, 'welcome')) {
 			conn.setWelcome(msg.payload.client_id)
-			this.you = msg.payload.you ?? null
 			devices.replaceAll(
 				msg.payload.snapshot.devices,
 				msg.payload.snapshot.update_id,
@@ -229,14 +197,6 @@ export class PbClient {
 		}
 		if (isType(msg, 'error')) {
 			conn.pushError(`${msg.payload.code}: ${msg.payload.message}`)
-			return
-		}
-		if (isType(msg, 'world')) {
-			this.onWorld?.(msg.payload)
-			return
-		}
-		if (isType(msg, 'event')) {
-			this.onMpEvent?.(msg.payload)
 			return
 		}
 		if (isType(msg, 'admin_restarting')) {
