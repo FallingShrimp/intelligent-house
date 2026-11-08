@@ -1597,7 +1597,9 @@ export class World {
 				blocking: p.blocking,
 				anim: p.anim,
 				kills: p.kills,
-				max_block: p.stats.blockMaxS, parry_pct: p.stats.parryPct, charge_dur: round2(p.stats.chargeMax / p.stats.chargeSpd),
+				max_block: p.stats.blockMaxS, parry_pct: p.stats.parryPct,
+				// 蓄力满时长按武器下发：无锋剑 = chargeMax/chargeSpd（蓄力速度越快充满越短）；苍弓 = chargeMax（不受蓄力速度影响）
+				charge_dur: round2(p.weapon === 'bow' ? p.stats.chargeMax : p.stats.chargeMax / p.stats.chargeSpd),
 				thorn_pct: p.stats.thorn, lifesteal: p.stats.lifesteal, multi_wave: p.stats.multiWave,
 				impact: p.stats.impact, stability: p.stats.stability,
 				crit_rate: p.stats.critRate, crit_dmg: p.stats.critDmg,
@@ -1805,7 +1807,8 @@ class BowWeapon extends BaseWeapon {
 	startCharge(p: MpPlayer, now: number): void {
 		if (p.stunUntil > now || now < p.guardBreakUntil) return
 		p.chargeStartAt = now
-		p.beamNextAt = 0 // 立即射出第一段激光
+		// 首段激光延迟一个 tick（点按 < tick 期松手只算普攻射球）；出伤频率 = 蓄力速度（间隔 / chargeSpd）
+		p.beamNextAt = now + BEAM_TICK_S / p.stats.chargeSpd
 	}
 
 	/** 提前松手：激光停止，无爆发 */
@@ -1823,16 +1826,16 @@ class BowWeapon extends BaseWeapon {
 		w.beamDamage(p, 40 * p.stats.dmgMul, 11, now)
 	}
 
-	/** 蓄力达到上限（chargeDur = chargeMax / chargeSpd，与剑同公式）→ World tick 自动触发爆发 */
+	/** 蓄力达到上限（chargeMax，不受蓄力速度影响——蓄力速度只决定激光出伤频率）→ World tick 自动触发爆发 */
 	maxChargeReached(p: MpPlayer, now: number): boolean {
-		return p.chargeStartAt >= 0 && now - p.chargeStartAt >= p.stats.chargeMax / p.stats.chargeSpd
+		return p.chargeStartAt >= 0 && now - p.chargeStartAt >= p.stats.chargeMax
 	}
 
-	/** 持续激光：蓄力中每 0.2s 对准星射线目标结算 15 × dmgMul 伤 / impact 3（穿透 + 隔墙拦截） */
+	/** 持续激光：蓄力中每 BEAM_TICK_S/chargeSpd 对准星射线目标结算 15 × dmgMul 伤 / impact 3（穿透 + 隔墙拦截） */
 	tick(p: MpPlayer, _dt: number, now: number): void {
 		if (p.chargeStartAt < 0 || p.hp <= 0 || p.stunUntil > now || now < p.guardBreakUntil) return
 		if (now < p.beamNextAt) return
-		p.beamNextAt = now + BEAM_TICK_S
+		p.beamNextAt = now + BEAM_TICK_S / p.stats.chargeSpd
 		this.world.beamDamage(p, 15 * p.stats.dmgMul, 3, now)
 	}
 }

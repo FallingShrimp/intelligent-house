@@ -67,16 +67,16 @@ export interface AttackCtx {
 	onGround: boolean
 	/** 准星指向的场景交互物（台灯 / 门 / 电视等）：远程武器不吞交互用（近战武器忽略） */
 	interactTag?: string | null
+	/** 准星指向队友尸体（复活优先于普攻，场景层判定后传入） */
+	corpse?: boolean
 }
 
 /**
- * 武器抽象（PF 侧 = 输入编排 + 视模型表现）：
- * - normalAttack：点击普攻（返回 true = 已消费本次点击）
- * - startCharge：按下左键开始蓄力（返回 true = SceneManager 冻结移动）
- * - heavyAttack：松开左键（timeCharged = 已蓄秒数；返回 true = 松开被武器消费，
- *   否则编排层回落普攻链——双手剑短按回落普攻语义在此实现）
- * - maxChargeReached：update 每帧轮询，蓄满是否立即停手并触发 heavyAttack
- *   （双手剑恒 false = 蓄满不自动释放；苍弓 true = 蓄满自动爆发）
+ * 武器抽象（PF 侧 = 输入管线 + 视模型表现）：
+ * 输入语义全武器统一，由编排层（PlayerCombat）模板化驱动，武器只实现自身行为：
+ * - 按下左键 → 立即普攻 normalAttack（无目标空挥；指向交互物 / 尸体时交还场景层）
+ * - 按住 ≥0.2s → beginCharge 进入蓄力；松手 → releaseCharge 自定义结算（未满取消）
+ * - chargeDur：蓄力满时长（武器自定义蓄力循环，PB 按当前武器下发权威值）
  */
 export abstract class BaseWeapon {
 	abstract weaponName: string
@@ -91,21 +91,29 @@ export abstract class BaseWeapon {
 	abstract normalAttack(now: number, ctx: AttackCtx): boolean
 	/** 格挡起手（右键按下）：是否成功进入格挡（武器自行决定是否支持，如苍弓不可格挡） */
 	abstract parry(now: number): boolean
-	abstract startCharge(now: number): boolean
-	abstract heavyAttack(timeCharged: number, now: number): boolean
-	abstract maxChargeReached(now: number): boolean
+	/** 进入重击蓄力（按住 ≥0.2s 时编排层触发；返回 false = 当前状态不可蓄力） */
+	abstract beginCharge(now: number): boolean
+	/**
+	 * 蓄力松手结算（held = 已蓄秒数，编排层已清 chargeStart）。
+	 * 未蓄满 = 取消蓄力（无动作，普攻已在按下时触发）；蓄满 = 重击结算。
+	 */
+	abstract releaseCharge(held: number, now: number): boolean
 	/** 无交互目标时的空挥（保持手感，同样上报意图） */
 	abstract whiff(now: number): void
 	/** 当前动作标签（mp_input.anim，供远程玩家渲染） */
 	abstract animTag(): string | null
 	/** 打断当前动作（眩晕 / 突进命中等） */
 	abstract interrupt(): void
-	/** 帧更新：武器内部动画推进 */
+	/** 帧更新：武器内部动画推进（蓄满自动停手等蓄力循环行为也在此自定义） */
 	abstract update(dt: number, now: number): void
 	/** 帧更新：视模型姿态 */
 	abstract updatePose(dt: number, now: number): void
 	/** 蓄力被取消（拖拽视角 / 眩晕破防打断）：弓上报 charge_stop 同步 PB，剑无需处理 */
 	onChargeCancel(): void {}
+	/** 松手点击是否为蓄力余波（蓄满自动停手后的松手吞掉，不触发普攻 / 交互；默认否） */
+	consumeRelease(): boolean { return false }
+	/** PB beam_burst（苍弓蓄满爆发）回写：本地镜像停手（默认无需处理） */
+	onBeamBurst(): void {}
 	abstract dispose(): void
 }
 
@@ -214,10 +222,12 @@ export class PlayerCombat {
 	blocking = false
 	blockMaxS = 1.0      // 格挡最大持续 s（增益 +0.25s）
 	parryPct = 0.5       // 完美格挡窗口 = blockMaxS × parryPct（增益 +2%）
-	chargeDur = 1.0      // 重击蓄力时长 s（蓄力速度增益 → 时长缩短）
+	chargeDur = 1.0      // 重击蓄力时长 s（PB 按当前武器下发：剑 = chargeMax/chargeSpd，弓 = chargeMax）
 	weaponId: WeaponId = 'sword' // 当前武器（PB 快照回写）
 	/** 重击蓄力开始（本地 loop 秒；>=0 表示蓄力中——剑 / 弓共用编排层状态） */
 	chargeStart = -1
+	/** 左键按下时刻（loop 秒；-1 = 未按下。按住 ≥CHARGE_PRESS_S 由 update 进入蓄力） */
+	private pressAt = -1
 
 	stunUntilLocal = 0  // loop 秒钟基准的眩晕截止（快照 stun_for 折算）
 	private guardBreakUntil = 0
@@ -321,30 +331,54 @@ export class PlayerCombat {
 		this.hooks.onToast(text)
 	}
 
-	// ---------------- 输入编排（委托当前武器） ----------------
+	// ---------------- 输入管线（左键：按下立即普攻，按住 ≥0.2s 进入重击蓄力） ----------------
+
+	/** 按住进入重击蓄力的延迟 s：按下立即普攻，继续按住才进入蓄力 */
+	private static readonly CHARGE_PRESS_S = 0.2
 
 	/**
-	 * 左键点击普攻：眩晕 / 破防中吞掉点击；具体行为（反击 / 追击 / 空中戳刺 /
-	 * 三段连击 / 射球）由当前武器决定并上报意图。返回 false = 未消费（交给场景交互）。
-	 * interactTag = 准星指向的场景交互物（远程武器不吞交互用，近战忽略）。
+	 * 左键按下：立即普攻（无目标空挥保持手感）；准星指向尸体 / 交互物时交还场景层
+	 * （不普攻不蓄力）。返回 'scene' = 场景层执行 revive / interact，'attack' = 按住跟踪蓄力线。
 	 */
-	normalAttack(now: number, zombies: NetZombie[], remotes: RemoteCenter[], camera: THREE.PerspectiveCamera, onGround: boolean, interactTag: string | null = null): boolean {
-		if (this.hp <= 0) return true // 死亡：吞掉点击（复活经死亡覆盖层按钮）
-		if (this.stunUntilLocal > now) return true
-		if (now < this.guardBreakUntil) return true
+	onLeftPress(now: number, ctx: AttackCtx): 'attack' | 'scene' | 'none' {
+		if (!this.canAct(now)) return 'none' // 死亡 / 眩晕 / 破防：吞掉
 		if (this.blocking) this.endBlock(now)
-		return this.weapon.normalAttack(now, { zombies, remotes, camera, onGround, interactTag })
+		if (ctx.interactTag || ctx.corpse) return 'scene'
+		// 按下立即普攻（无目标 → 空挥保持手感）
+		if (!this.weapon.normalAttack(now, ctx)) this.weapon.whiff(now)
+		// 按住跟踪：≥CHARGE_PRESS_S 由 update 进入蓄力
+		this.pressAt = now
+		return 'attack'
 	}
 
-	/** 空挥（无交互目标时保持手感；死亡 / 眩晕中忽略） */
-	whiffSwing(now: number): void {
-		if (this.hp <= 0 || this.stunUntilLocal > now) return
-		this.weapon.whiff(now)
+	/** 左键拖拽（非点击）：取消按压与蓄力 */
+	onLeftCancel(): void {
+		this.pressAt = -1
+		if (this.chargeStart >= 0) this.endCharge()
 	}
 
-	/** 按下左键：开始重击蓄力（成功后 SceneManager 冻结移动） */
-	startCharge(now: number): boolean {
-		return this.weapon.startCharge(now)
+	/**
+	 * 左键松开：仅结算蓄力线（普攻 / 交互已在按下时触发）。蓄力中 → 武器自定义结算
+	 * （未满取消 / 蓄满重击）；未蓄力 → 无动作或蓄满停手余波。返回 true = 已消费。
+	 */
+	onLeftRelease(now: number): boolean {
+		this.pressAt = -1
+		if (this.chargeStart >= 0) {
+			const held = now - this.chargeStart
+			this.chargeStart = -1
+			return this.weapon.releaseCharge(held, now)
+		}
+		return this.weapon.consumeRelease() // 蓄满自动停手后的松手余波
+	}
+
+	/** 左键按住中（按压期 / 蓄力期）：场景层用于禁格挡 / 禁切武器 */
+	get isPressing(): boolean {
+		return this.pressAt >= 0 || this.chargeStart >= 0
+	}
+
+	/** 重击蓄力中（蓄力减速移动 / 激光音效等场景表现用） */
+	get isCharging(): boolean {
+		return this.chargeStart >= 0
 	}
 
 	/** 已蓄力时长 s（未蓄力返回 0） */
@@ -352,17 +386,18 @@ export class PlayerCombat {
 		return this.chargeStart < 0 ? 0 : now - this.chargeStart
 	}
 
-	/** 取消蓄力（松开未满 / 拖拽 / 状态打断）：通知武器同步 PB（弓上报 charge_stop） */
+	/** 取消蓄力（拖拽 / 状态打断）：通知武器同步 PB（弓上报 charge_stop） */
 	endCharge(): void {
+		this.pressAt = -1
 		if (this.chargeStart >= 0) {
 			this.chargeStart = -1
 			this.weapon.onChargeCancel()
 		}
 	}
 
-	/** 松开左键：武器结算重击（未蓄满返回 false 回落普攻链） */
-	heavyAttack(timeCharged: number, now: number): boolean {
-		return this.weapon.heavyAttack(timeCharged, now)
+	/** PB beam_burst（苍弓蓄满爆发）回写：强制对齐本地蓄力态（PB tick 先于本地镜像的边缘时序） */
+	onBeamBurst(): void {
+		this.weapon.onBeamBurst()
 	}
 
 	/** 循环切换武器：返回目标武器（PB 快照回写后 weaponId 才真正变化） */
@@ -416,14 +451,15 @@ export class PlayerCombat {
 		if (this.blocking && now - this.blockStart >= this.blockMaxS) this.endBlock(now)
 		// 蓄力中状态失效（死亡 / 眩晕 / 破防）→ 自动取消（弓上报 charge_stop，PB stopCharge 幂等）
 		if (this.chargeStart >= 0 && !this.canAct(now)) this.endCharge()
+		// 按住左键 ≥ CHARGE_PRESS_S → 进入重击蓄力（行为由当前武器定义；失败不再重试）
+		if (this.pressAt >= 0 && this.chargeStart < 0 && now - this.pressAt >= PlayerCombat.CHARGE_PRESS_S) {
+			this.pressAt = -1
+			this.weapon.beginCharge(now)
+		}
 		// 蓄满瞬间提示音（每次蓄力只播一次）
 		if (this.chargeStart >= 0 && !this.chargeNotified && now - this.chargeStart >= this.chargeDur) {
 			this.chargeNotified = true
 			playSfx('flashAlert')
-		}
-		// 蓄满自动停手：武器 maxChargeReached → 立刻 heavyAttack（苍弓爆发挂点；剑恒 false）
-		if (this.chargeStart >= 0 && this.weapon.maxChargeReached(now)) {
-			this.weapon.heavyAttack(now - this.chargeStart, now)
 		}
 
 		// 武器内部动画推进（挥砍 / 缓冲连段 / 幽灵）
@@ -621,27 +657,23 @@ class SwordWeapon extends BaseWeapon {
 		return true
 	}
 
-	/** 按下左键：开始蓄力（成功后 SceneManager 冻结移动） */
-	startCharge(now: number): boolean {
+	/** 进入蓄力（按住 ≥0.2s 由编排层触发）：本地记录蓄力起点（剑蓄力无 PB 状态） */
+	beginCharge(now: number): boolean {
 		return this.c.tryBeginCharge(now)
 	}
 
-	/** 蓄满释放：上劈动画 + 发射剑气意图（未蓄满返回 false；hold 供 PB 结算蓄力体力消耗） */
-	heavyAttack(timeCharged: number, now: number): boolean {
-		const c = this.c
-		if (c.chargeStart < 0 || now - c.chargeStart < c.chargeDur) {
-			c.chargeStart = -1
-			return false
-		}
-		c.chargeStart = -1
+	/**
+	 * 蓄力松手：未蓄满 → 取消（无动作，普攻已在按下时触发）；蓄满 → 上劈动画 + 剑气意图
+	 * （hold 为真实按住秒数，PB 结算 effHold = min(hold × chargeSpd, chargeMax)——
+	 * 蓄力速度越快同样按住时长蓄得越满）。蓄力时长 = chargeMax / chargeSpd（PB 下发）。
+	 */
+	releaseCharge(held: number, now: number): boolean {
+		if (held < this.c.chargeDur) return true // 未蓄满：取消蓄力
 		this.combo = -1 // 剑气不算三段连击
 		this.startSwing(SWING_CHASE, now)
-		pbClient.sendMpAction({ kind: 'wave', hold: Math.round(timeCharged * 10) / 10 })
+		pbClient.sendMpAction({ kind: 'wave', hold: Math.round(held * 10) / 10 })
 		return true
 	}
-
-	/** 蓄满不自动释放（松手才发剑气） */
-	maxChargeReached(_now: number): boolean { return false }
 
 	/** 无交互目标时的空挥（保持手感，同样上报意图） */
 	whiff(now: number) {
@@ -867,6 +899,7 @@ class BowWeapon extends BaseWeapon {
 	private orbTip: THREE.Mesh | null = null // 搭弦能量球（蓄力显示，随进度增大）
 	private cur: SwingDef | null = null
 	private curT = 0
+	private fullStop = false // 蓄满自动停手标记（之后的松手为余波，吞掉不触发普攻 / 交互）
 
 	private tmpD = new THREE.Vector3()
 
@@ -896,30 +929,42 @@ class BowWeapon extends BaseWeapon {
 		return true
 	}
 
-	/** 按下左键：拉弓蓄力（本地编排状态 + charge_start 意图，激光表现由蓄力态驱动） */
-	startCharge(now: number): boolean {
+	/** 进入蓄力（按住 ≥0.2s 由编排层触发）：拉弓瞄准 + charge_start 意图（PB 激光蓄力计时） */
+	beginCharge(now: number): boolean {
 		if (!this.c.tryBeginCharge(now)) return false
 		pbClient.sendMpAction({ kind: 'charge_start' })
 		return true
 	}
 
 	/**
-	 * 松开左键：未蓄满 → charge_stop 停止激光；蓄满 → 本地镜像停手即可
-	 * （爆发由 PB tick 轮询自动触发，特效 / 音效等 PB beam_burst 事件驱动，避免双端双重）。
+	 * 蓄力松手：未蓄满 → charge_stop 停激光并取消（无动作，射球已在按下时触发）；
+	 * 蓄满 → 本地镜像停手即可（爆发由 PB tick 轮询自动触发，特效 / 音效等
+	 * PB beam_burst 事件驱动，避免双端双重）。
+	 * 蓄力时长 = chargeMax（不受蓄力速度影响，PB 按武器下发）；蓄力速度只影响激光出伤频率。
 	 */
-	heavyAttack(timeCharged: number, _now: number): boolean {
-		const c = this.c
-		if (c.chargeStart < 0) return true // 蓄满自动停手后的松手余波
-		const full = timeCharged >= c.chargeDur - 1e-3
-		c.chargeStart = -1
+	releaseCharge(held: number, _now: number): boolean {
+		if (held < this.c.chargeDur - 1e-3) {
+			pbClient.sendMpAction({ kind: 'charge_stop' })
+			return true
+		}
 		this.startShoot(false) // 弓回弹后摆（不重复上报 shoot）
-		if (!full) pbClient.sendMpAction({ kind: 'charge_stop' })
 		return true
 	}
 
-	/** 蓄满自动停手（本地镜像；PB 侧 tick 轮询同规则，事件为准防视觉漂移） */
-	maxChargeReached(now: number): boolean {
-		return this.c.chargeStart >= 0 && now - this.c.chargeStart >= this.c.chargeDur
+	/** 蓄满自动停手后的松手余波：吞掉（不触发普攻 / 交互） */
+	consumeRelease(): boolean {
+		if (!this.fullStop) return false
+		this.fullStop = false
+		return true
+	}
+
+	/** PB beam_burst（蓄满爆发）回写：本地镜像停手，之后的松手为余波 */
+	onBeamBurst(): void {
+		if (this.c.chargeStart >= 0) {
+			this.c.chargeStart = -1
+			this.fullStop = true
+			this.startShoot(false)
+		}
 	}
 
 	/** 无交互目标空放 = 照常射球（远程武器） */
@@ -948,10 +993,16 @@ class BowWeapon extends BaseWeapon {
 		pbClient.sendMpAction({ kind: 'charge_stop' })
 	}
 
-	update(dt: number, _now: number) {
+	update(dt: number, now: number) {
 		if (this.cur) {
 			this.curT += dt
 			if (this.curT >= this.cur.dur) this.cur = null
+		}
+		// 蓄满自动停手（本地镜像；PB tick 同规则自动爆发 + beam_burst 事件为准防漂移）
+		if (this.c.chargeStart >= 0 && now - this.c.chargeStart >= this.c.chargeDur) {
+			this.c.chargeStart = -1
+			this.fullStop = true
+			this.startShoot(false)
 		}
 	}
 

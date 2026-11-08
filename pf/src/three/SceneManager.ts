@@ -145,7 +145,6 @@ export class SceneManager {
 	private onScene?: (scene: SceneState) => void
 	private onLevelUp?: (level: number) => void
 	private meDead = false
-	private charging = false // 重击蓄力中（按住左键，移动冻结）
 	private pickSt: PickState = { active: false, options: null, done: false }
 	private lastPickKey = ''
 
@@ -280,11 +279,8 @@ export class SceneManager {
 	setMode(mode: ViewMode) {
 		if (this.mode === mode || this.disposed) return
 		this.mode = mode
-		// 切视角一律取消蓄力（防残留冻结移动）
-		if (this.charging) {
-			this.charging = false
-			this.combat.endCharge()
-		}
+		// 切视角一律取消按压 / 蓄力（防残留冻结移动）
+		this.combat.onLeftCancel()
 		if (mode === 'walk') {
 			// 进入漫游：相机移到室内人眼高度
 			this.orbit.enabled = false
@@ -412,15 +408,32 @@ export class SceneManager {
 
 	private handlePointerDown = (e: PointerEvent) => {
 		if (e.button === 2) {
-			// 按住右键 → 格挡（仅第一人称锁定时；蓄力中不可格挡）
-			if (this.mode === 'walk' && this.lockCtl.isLocked && !this.charging) this.combat.startBlock(this.lastTime)
+			// 按住右键 → 格挡（仅第一人称锁定时；左键按住期间不可格挡）
+			if (this.mode === 'walk' && this.lockCtl.isLocked && !this.combat.isPressing) this.combat.startBlock(this.lastTime)
 			return
 		}
 		if (e.button !== 0) return
 		this.pointerDownPos = { x: e.clientX, y: e.clientY }
-		// 第一人称锁定：按下左键开始蓄力重击（松开判定：<1s 普攻，≥1s 剑气）
-		if (this.mode === 'walk' && this.lockCtl.isLocked && this.combat.startCharge(this.lastTime)) {
-			this.charging = true
+		// 第一人称锁定：按下立即普攻 / 交还场景交互；按住 ≥0.2s 进入蓄力（管线在 PlayerCombat）
+		if (this.mode === 'walk' && this.lockCtl.isLocked) {
+			const corpse = this.pickCorpse()
+			const tag = this.pickInteractable()
+			const r = this.combat.onLeftPress(this.lastTime, {
+				zombies: this.zombies,
+				remotes: this.remotePlayers.centers(),
+				camera: this.camera,
+				onGround: !this.flying && this.camera.position.y <= EYE_HEIGHT + 1e-4,
+				interactTag: tag,
+				corpse: corpse !== null,
+			})
+			if (r === 'scene') {
+				if (corpse) {
+					pbClient.sendMpAction({ kind: 'revive', target: corpse.uuid })
+					this.onToast?.(`正在复活 ${corpse.name}`)
+				} else if (tag) {
+					this.interact(tag)
+				}
+			}
 		}
 	}
 
@@ -433,40 +446,13 @@ export class SceneManager {
 		const moved = Math.hypot(e.clientX - this.pointerDownPos.x, e.clientY - this.pointerDownPos.y)
 		this.pointerDownPos = null
 		if (moved > CLICK_MOVE_PX) {
-			// 拖拽视角非点击：取消蓄力
-			if (this.charging) {
-				this.charging = false
-				this.combat.endCharge()
-			}
+			// 拖拽视角非点击：取消按压与蓄力
+			this.combat.onLeftCancel()
 			return
 		}
-		// 第一人称锁定：蓄力判定释放（≥蓄力时长剑气，否则取消蓄力回落普攻/交互）
+		// 第一人称锁定：松手仅结算蓄力线（普攻 / 交互已在按下时触发）
 		if (this.mode === 'walk' && this.lockCtl.isLocked) {
-			if (this.charging) {
-				this.charging = false
-				// 武器结算重击（剑未蓄满自动回落 false；蓄满停手已由 maxChargeReached 自动触发）
-				if (this.combat.heavyAttack(this.combat.chargeHold(this.lastTime), this.lastTime)) return
-			}
-			// 队友复活：准星指向 3m 内的尸体 → revive 意图（优先于攻击 / 交互）
-			const corpse = this.pickCorpse()
-			if (corpse) {
-				pbClient.sendMpAction({ kind: 'revive', target: corpse.uuid })
-				this.onToast?.(`正在复活 ${corpse.name}`)
-				return
-			}
-			// 交互物先拾取（远程武器不吞台灯 / 开门：经 ctx 传入武器判断）
-			const tag = this.pickInteractable()
-			const consumed = this.combat.normalAttack(
-				this.lastTime, this.zombies, this.remotePlayers.centers(), this.camera,
-				!this.flying && this.camera.position.y <= EYE_HEIGHT + 1e-4,
-				tag,
-			)
-			if (consumed) return
-			if (tag) {
-				this.interact(tag)
-				return
-			}
-			this.combat.whiffSwing(this.lastTime) // 空挥保持手感
+			this.combat.onLeftRelease(this.lastTime)
 			return
 		}
 		const tag = this.pickInteractable(e)
@@ -986,7 +972,7 @@ export class SceneManager {
 				playSfx('beamBurst')
 				if (e.by === me) {
 					// 发射者自己：屏幕微震 + 强制对齐本地蓄力态（PB tick 先于本地镜像的边缘时序）
-					if (this.combat.chargeStart >= 0) this.combat.chargeStart = -1
+					this.combat.onBeamBurst()
 					this.fovKick = BEAM_BURST_S
 				}
 				break
@@ -1114,8 +1100,8 @@ export class SceneManager {
 				}
 			}
 		}
-		// 第一人称锁定时 Q / E 切换上一把 / 下一把武器（蓄力中不可切换，PB 快照回写为准）
-		if ((e.code === 'KeyQ' || e.code === 'KeyE') && !e.repeat && this.mode === 'walk' && this.lockCtl.isLocked && !this.charging) {
+		// 第一人称锁定时 Q / E 切换上一把 / 下一把武器（按住左键期间不可切换，PB 快照回写为准）
+		if ((e.code === 'KeyQ' || e.code === 'KeyE') && !e.repeat && this.mode === 'walk' && this.lockCtl.isLocked && !this.combat.isPressing) {
 			const target = this.combat.cycleWeapon(e.code === 'KeyE' ? 1 : -1)
 			pbClient.sendMpAction({ kind: 'weapon', weapon: target })
 			this.onToast?.(`切换武器：${WEAPON_NAMES[target]}`)
@@ -1216,8 +1202,8 @@ export class SceneManager {
 
 		// ---- 水平：WASD 沿相机水平朝向加速（惯性积累） ----
 		// 蓄力重击期间移动减速 50%（仍可移动），并打断疾跑
-		const chargeSlow = this.charging ? 0.5 : 1
-		if (this.charging) this.sprinting = false
+		const chargeSlow = this.combat.isCharging ? 0.5 : 1
+		if (this.combat.isCharging) this.sprinting = false
 		const forward = (this.keys.has('KeyW') ? 1 : 0) - (this.keys.has('KeyS') ? 1 : 0)
 		const strafe = (this.keys.has('KeyD') ? 1 : 0) - (this.keys.has('KeyA') ? 1 : 0)
 		const hasInput = forward !== 0 || strafe !== 0
